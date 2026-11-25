@@ -1,0 +1,10 @@
+node_modules/
+dist/
+server.mjs
+portable/
+release/
+release-test/
+storage/
+backups/
+*.log
+.DS_Store

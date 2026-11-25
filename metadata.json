@@ -1,0 +1,8 @@
+{
+  "name": "کتابخانه فارسی MD",
+  "description": "کتابخانه فارسی MD — مدیریت، جست‌وجو، ترجمه و مطالعهٔ کتاب‌های Markdown با پنل‌های شناور، گزارش حرفه‌ای و ابزارهای گروهی.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

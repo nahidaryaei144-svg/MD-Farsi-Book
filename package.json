@@ -1,0 +1,105 @@
+{
+  "name": "farsi-md-library",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Modern Persian Markdown library with floating panels, reader, reports and batch tools",
+  "author": "کتابخانه فارسی MD",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:client": "vite",
+    "build": "npm run build:server && vite build",
+    "build:server": "esbuild server.ts --bundle --platform=node --format=esm --target=node20 --external:vite --banner:js=\"import { createRequire as __bundleCreateRequire } from 'node:module'; var require = __bundleCreateRequire(import.meta.url);\" --outfile=server.mjs",
+    "build:electron:win": "npm run build && electron-builder --win nsis",
+    "electron": "electron .",
+    "build:portable": "npm run build && node scripts/build-portable.mjs --obfuscate",
+    "build:portable:plain": "npm run build && node scripts/build-portable.mjs --plain",
+    "start": "node server.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "lint": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit"
+  },
+  "dependencies": {
+    "@fontsource-variable/vazirmatn": "^5.3.0",
+    "@google/genai": "^3.6.1",
+    "marked": "^18.1.3",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@babel/parser": "^8.1.0",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.2.1",
+    "esbuild": "^0.28.2",
+    "html-minifier-terser": "^7.2.0",
+    "javascript-obfuscator": "^5.10.0",
+    "postcss": "^8.5.32",
+    "postcss-selector-parser": "^7.1.7",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "electron": "^42.0.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "ir.mdfarsibook.library",
+    "productName": "کتابخانه فارسی MD",
+    "copyright": "© 2026 کتابخانه فارسی MD",
+    "asar": true,
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "server.mjs",
+      "electron/main.cjs",
+      "build/icon.png"
+    ],
+    "extraResources": [
+      {
+        "from": "data",
+        "to": "data",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "legalTrademarks": "کتابخانه فارسی MD",
+      "requestedExecutionLevel": "asInvoker",
+      "artifactName": "Farsi-MD-Library-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "کتابخانه فارسی MD",
+      "uninstallDisplayName": "کتابخانه فارسی MD",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "onlyLoadAppFromAsar": true
+    }
+  }
+}

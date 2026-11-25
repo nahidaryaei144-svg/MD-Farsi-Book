@@ -32,7 +32,12 @@
 ## پیش‌نیازها
 
 - **Node.js** نسخهٔ `20.19` یا بالاتر
-- کلید `GEMINI_API_KEY` در متغیرهای محیطی سرور (برای استفاده از موتور رایگان جمنای)
+- کلید `GEMINI_API_KEY یا از مدل های دیگر برای ترجمه کتاب ها البته استفاده از گوگل ترانسلیت هیچیزی نیاز ندارد فقط آنرا انتخاب کنید و زبان فارسی را انتخاب کنید بس
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/75edabb8-880f-4e56-92e5-6c218ca30b3c" />
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/f13e0541-ae76-4d0c-ab40-f5c0600904d9" />
+
 
 ---
 

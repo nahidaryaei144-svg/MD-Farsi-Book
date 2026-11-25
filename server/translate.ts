@@ -81,6 +81,7 @@ export interface TranslationJob {
     samples: TranslationSample[];
     speed: number;
     etaSeconds: number | null;
+    bilingual?: boolean;
 }
 
 export interface TranslationEstimate {
@@ -117,6 +118,7 @@ type Token = TextToken | FixedToken;
 interface Line {
     tokens: Token[];
     ending: string;
+    alreadyBilingual?: boolean;
 }
 
 /* The table of contents is translated before the body when the reader picks
@@ -184,6 +186,30 @@ function tokenizeInline(text: string, state: TokenState): Token[] {
             }
         }
         if (text[i] === '<') {
+            const biMatch = text
+                .slice(i)
+                .match(/^<span\b[^>]*\bclass=["'][^"']*\bbi-orig\b[^"']*["'][^>]*>/i);
+            if (biMatch) {
+                let cursor = i + biMatch[0].length;
+                let depth = 1;
+                while (cursor < text.length && depth > 0) {
+                    const nextOpen = text.indexOf('<span', cursor);
+                    const nextClose = text.indexOf('</span>', cursor);
+                    if (nextClose < 0) break;
+                    if (nextOpen >= 0 && nextOpen < nextClose) {
+                        depth += 1;
+                        cursor = nextOpen + 5;
+                    } else {
+                        depth -= 1;
+                        cursor = nextClose + 7;
+                    }
+                }
+                if (depth === 0) {
+                    addFixed(text.slice(i, cursor));
+                    i = cursor;
+                    continue;
+                }
+            }
             const end = text.indexOf('>', i + 1);
             if (end >= 0) {
                 addFixed(text.slice(i, end + 1));
@@ -360,27 +386,147 @@ function buildModel(content: string): BookModel {
         /* A line holding only `---` separates two pages of the book, exactly as
            the reading view splits it. A ruler inside a code block is not one. */
         if (!inCode && /^\s*---\s*$/.test(line)) page += 1;
-        lines.push({ tokens: tokenized, ending });
+        const alreadyBilingual = /<span\b[^>]*\bclass=["'][^"']*\bbi-orig\b/i.test(line);
+        lines.push({ tokens: tokenized, ending, alreadyBilingual });
     }
 
     return { frontmatter, lines, segments: state.segments };
 }
 
+function renderTokensOrig(tokens: Token[]): string {
+    return tokens.map((token) => token.value).join('');
+}
+
+function renderTokensTrans(
+    tokens: Token[],
+    translations: Map<number, string>,
+    normalize: (value: string) => string,
+    stripAnchors = false
+): string {
+    return tokens
+        .map((token) => {
+            if (token.type === 'text') return normalize(translations.get(token.id) ?? token.value);
+            if (stripAnchors && /^<a\b[^>]*\bid=/i.test(token.value)) return '';
+            return token.value;
+        })
+        .join('');
+}
+
+function isMarkdownTableRow(tokens: Token[]): boolean {
+    let pipeCount = 0;
+    let firstNonSpace = '';
+    for (const token of tokens) {
+        if (token.type === 'fixed' && token.value === '|') pipeCount += 1;
+        if (!firstNonSpace && token.value.trim()) firstNonSpace = token.value.trim();
+    }
+    return pipeCount >= 2 && firstNonSpace.startsWith('|');
+}
+
+function renderBilingualTableRow(
+    line: Line,
+    translations: Map<number, string>,
+    normalize: (value: string) => string
+): string {
+    const groups: Token[][] = [];
+    let current: Token[] = [];
+    for (const token of line.tokens) {
+        if (token.type === 'fixed' && token.value === '|') {
+            groups.push(current);
+            current = [];
+        } else {
+            current.push(token);
+        }
+    }
+    groups.push(current);
+
+    if (groups.length < 3) {
+        return renderTokensTrans(line.tokens, translations, normalize) + line.ending;
+    }
+
+    const rendered = groups.map((cellTokens, idx) => {
+        if (idx === 0 || idx === groups.length - 1) {
+            return renderTokensOrig(cellTokens);
+        }
+        const orig = renderTokensOrig(cellTokens).trim();
+        const trans = renderTokensTrans(cellTokens, translations, normalize, true).trim();
+        if (!orig || !trans || orig === trans) return renderTokensTrans(cellTokens, translations, normalize);
+        return ` <span class="bi-orig">${orig}</span><br><span class="bi-trans">${trans}</span> `;
+    });
+
+    return rendered.join('|') + line.ending;
+}
+
 function renderBody(
     model: BookModel,
     translations: Map<number, string>,
-    normalize: (value: string) => string = (value) => value
+    normalize: (value: string) => string = (value) => value,
+    options?: { bilingual?: boolean; newline?: string }
 ): string {
+    const bilingual = options?.bilingual === true;
+    const paraSep = (options?.newline || '\n').repeat(2);
+
     return model.lines
         .map((line) => {
-            const text = line.tokens
-                .map((token) =>
-                    token.type === 'text'
-                        ? normalize(translations.get(token.id) ?? token.value)
-                        : token.value
+            if (!bilingual || line.alreadyBilingual) {
+                return (
+                    line.tokens
+                        .map((token) =>
+                            token.type === 'text'
+                                ? normalize(translations.get(token.id) ?? token.value)
+                                : token.value
+                        )
+                        .join('') + line.ending
+                );
+            }
+
+            const hasTranslated = line.tokens.some(
+                (token) =>
+                    token.type === 'text' &&
+                    translations.has(token.id) &&
+                    translations.get(token.id)!.trim() !== token.value.trim()
+            );
+            if (!hasTranslated) {
+                return renderTokensOrig(line.tokens) + line.ending;
+            }
+
+            if (isMarkdownTableRow(line.tokens)) {
+                return renderBilingualTableRow(line, translations, normalize);
+            }
+
+            let splitAt = 0;
+            if (
+                line.tokens[0]?.type === 'fixed' &&
+                /^(?:\s+| {0,3}>.*| {0,3}#{1,6}\s+.*| {0,3}(?:[-+*]|\d+[.)])\s+.*|\[\^[^\]]+\]:\s*|\(?¬\s*[\d\u06F0-\u06F9]+\)?\s*)$/.test(
+                    line.tokens[0].value
                 )
-                .join('');
-            return text + line.ending;
+            ) {
+                splitAt = 1;
+            }
+            while (
+                splitAt < line.tokens.length &&
+                line.tokens[splitAt].type === 'fixed' &&
+                /^<a\b[^>]*\bid=/i.test(line.tokens[splitAt].value)
+            ) {
+                splitAt += 1;
+            }
+
+            const prefix = renderTokensOrig(line.tokens.slice(0, splitAt));
+            const restTokens = line.tokens.slice(splitAt);
+            const origRest = renderTokensOrig(restTokens).trim();
+            const transRest = renderTokensTrans(restTokens, translations, normalize, true).trim();
+
+            if (!origRest || !transRest || origRest === transRest) {
+                return renderTokensTrans(line.tokens, translations, normalize) + line.ending;
+            }
+
+            const isStructured = /(?:^|\s)(?:#{1,6}\s|>\s?|[-+*]\s|\d+[.)]\s)|\[\^[^\]]+\]:|\(?¬/.test(
+                prefix
+            );
+            if (isStructured) {
+                return `${prefix}<span class="bi-orig">${origRest}</span><br><span class="bi-trans">${transRest}</span>${line.ending}`;
+            }
+
+            return `${prefix}<span class="bi-orig">${origRest}</span>${paraSep}<span class="bi-trans">${transRest}</span>${line.ending}`;
         })
         .join('');
 }
@@ -730,6 +876,7 @@ interface JobContext {
     frontmatter: string;
     newline: string;
     markTranslator: boolean;
+    bilingual: boolean;
     engine: TranslationEngine;
     order: TranslateOrder;
     /* Front-matter values are translated once and reused by every flush. */
@@ -871,7 +1018,12 @@ async function flushJob(ctx: JobContext, final = false): Promise<void> {
        anything else, so it is written to the file from the first flush on. */
     const frontmatter =
         final || ctx.order === 'structured' ? await localizedFrontmatter(ctx) : ctx.frontmatter;
-    const content = frontmatter + renderBody(ctx.model, ctx.translations);
+    const content =
+        frontmatter +
+        renderBody(ctx.model, ctx.translations, undefined, {
+            bilingual: ctx.bilingual,
+            newline: ctx.newline
+        });
     ctx.revision = await writeBookFile(ctx.filePath, content, ctx.revision);
     ctx.job.revision = ctx.revision;
     await persistMemory();
@@ -1276,6 +1428,7 @@ interface TranslateOptions {
     force?: unknown;
     markTranslator?: unknown;
     mode?: unknown;
+    bilingual?: unknown;
 }
 
 /* Any language is accepted, written either as a code (fa, en, ku…) or as a
@@ -1426,6 +1579,8 @@ export async function startTranslation(
     const force = options.force === true;
     const markTranslator = options.markTranslator !== false;
     const config = await readTranslateConfig();
+    const bilingual =
+        typeof options.bilingual === 'boolean' ? options.bilingual : config.bilingual;
     const engine = createEngine(config);
 
     const content = await fs.promises.readFile(filePath, 'utf8');
@@ -1453,6 +1608,7 @@ export async function startTranslation(
         engine: config.engine,
         engineLabel: engine.label,
         parallel,
+        bilingual,
         status: plan.queuedSegments ? 'running' : 'done',
         ...emptyJobStats(),
         total: plan.queuedSegments,
@@ -1498,6 +1654,7 @@ export async function startTranslation(
         frontmatter: model.frontmatter,
         newline: content.includes('\r\n') ? '\r\n' : '\n',
         markTranslator,
+        bilingual,
         engine,
         order: config.order
     };

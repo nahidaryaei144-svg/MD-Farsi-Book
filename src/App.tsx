@@ -567,6 +567,7 @@ export default function App() {
                         font={settings.font}
                         zoom={settings.zoom}
                         cornerRadius={settings.cornerRadius}
+                        bilingual={settings.bilingual}
                         libraryDir={library.libraryDir}
                         folders={library.folders}
                         bookCount={library.books.length}
@@ -575,6 +576,8 @@ export default function App() {
                         onFont={settings.setFont}
                         onZoom={settings.setZoom}
                         onCornerRadius={settings.setCornerRadius}
+                        onBilingual={settings.setBilingual}
+                        onResetBilingual={settings.resetBilingual}
                         onAddBook={() => setAddOpen(true)}
                         onCreateFolder={library.createFolder}
                         notify={notify}
@@ -677,6 +680,10 @@ export default function App() {
                     content={reader.content}
                     initialQuery={reader.initialQuery}
                     initialTarget={reader.initialTarget}
+                    bilingualDisplay={settings.bilingual.display}
+                    onBilingualDisplay={(display) =>
+                        settings.setBilingual({ ...settings.bilingual, display })
+                    }
                     onClose={() => setReader(null)}
                     onSaveMeta={saveReaderMeta}
                     onSaveContent={saveReaderContent}

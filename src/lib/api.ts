@@ -206,6 +206,7 @@ export const api = {
         glossary: string;
         concurrency: number;
         order: 'page' | 'structured';
+        bilingual?: boolean;
     }) =>
         post<{ success: boolean; config: TranslateConfigPublic }>('/api/translate/config', config),
 
@@ -219,7 +220,7 @@ export const api = {
     translateStart: (
         filename: string,
         target: string,
-        options: { force: boolean; markTranslator: boolean; mode: TranslationMode }
+        options: { force: boolean; markTranslator: boolean; mode: TranslationMode; bilingual?: boolean }
     ) =>
         post<{ success: boolean; job: TranslationJob }>('/api/translate/start', {
             filename,

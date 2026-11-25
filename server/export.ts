@@ -21,6 +21,7 @@ import { marked } from 'marked';
 import { DIST_DIR } from './config.js';
 import { parseFrontmatter, resolveBookPath } from './library.js';
 import { HttpError } from './http.js';
+import { measureText } from './text-stats.js';
 import { createZip } from './zip.js';
 
 const execFileAsync = promisify(execFile);
@@ -38,6 +39,10 @@ export interface ExportResult {
 /* ----------------------------- shared helpers ----------------------------- */
 
 const PERSIAN_DIGITS = '۰۱۲۳۴۵۶۷۸۹';
+
+function toPersianDigits(value: number | string): string {
+    return String(value).replace(/\d/g, (digit) => PERSIAN_DIGITS[Number(digit)] ?? digit);
+}
 
 function normalizeDigits(value: string): string {
     return String(value).replace(/[\u06F0-\u06F9]/g, (digit) =>
@@ -118,9 +123,16 @@ interface DocumentModel {
     filename: string;
     title: string;
     author: string;
+    authorInfo: string;
     translator: string;
     section: string;
+    volume: string;
+    volumeCount: string;
     tags: string[];
+    wordCount: number;
+    readingMinutes: number;
+    footnoteCount: number;
+    hasBilingual: boolean;
     frontmatterRaw: string;
     bodyRaw: string;
     format: 'book' | 'standard';
@@ -218,17 +230,34 @@ function parseDocument(content: string, filename: string): DocumentModel {
     const hasStandardNotes = /^\[\^[^\]\n]+\]:/m.test(bodyRaw);
     const format: 'book' | 'standard' = hasStandardNotes && !looksBook ? 'standard' : looksBook ? 'book' : 'standard';
 
+    const hasBilingual = /<span\b[^>]*\bclass=["'][^"']*\bbi-orig\b/i.test(bodyRaw);
+    const authorInfo = String(meta['معلومات نویسنده'] || '').trim();
+    const translator = String(meta['مترجم'] || meta.translator || '').trim();
+    const section = String(meta['بخش'] || meta.category || '').trim();
+    const volume = String(meta['جلد'] || '').trim();
+    const volumeCount = String(meta['تعداد جلدها'] || '').trim();
+    const tags = Array.isArray(meta['برچسب ها'])
+        ? (meta['برچسب ها'] as unknown[]).map(String).filter(Boolean)
+        : [];
+    const stats = measureText(stripTags(bodyRaw));
+    const readingMinutes = stats.words > 0 ? Math.max(1, Math.round(stats.words / 180)) : 0;
+
     if (format === 'standard') {
         const parsed = parseStandardNotes(bodyRaw);
         return {
             filename,
             title,
             author,
-            translator: String(meta['مترجم'] || meta.translator || '').trim(),
-            section: String(meta['بخش'] || meta.category || '').trim(),
-            tags: Array.isArray(meta['برچسب ها'])
-                ? (meta['برچسب ها'] as unknown[]).map(String).filter(Boolean)
-                : [],
+            authorInfo,
+            translator,
+            section,
+            volume,
+            volumeCount,
+            tags,
+            wordCount: stats.words,
+            readingMinutes,
+            footnoteCount: parsed.notes.length,
+            hasBilingual,
             frontmatterRaw,
             bodyRaw: parsed.body,
             format,
@@ -239,8 +268,8 @@ function parseDocument(content: string, filename: string): DocumentModel {
 
     const pages: ExportPage[] = [];
     const sections = bodyRaw.split(/\n[ \t]*---[ \t]*\n/);
-    for (const section of sections) {
-        const lines = section.split('\n');
+    for (const sec of sections) {
+        const lines = sec.split('\n');
         let marker = '';
         let inNotes = false;
         const contentLines: string[] = [];
@@ -268,15 +297,22 @@ function parseDocument(content: string, filename: string): DocumentModel {
     }
     if (!pages.length) pages.push({ marker: '', markdown: bodyRaw.trim(), footnotes: [] });
 
+    const footnoteCount = pages.reduce((sum, page) => sum + page.footnotes.length, 0);
+
     return {
         filename,
         title,
         author,
-        translator: String(meta['مترجم'] || meta.translator || '').trim(),
-        section: String(meta['بخش'] || meta.category || '').trim(),
-        tags: Array.isArray(meta['برچسب ها'])
-            ? (meta['برچسب ها'] as unknown[]).map(String).filter(Boolean)
-            : [],
+        authorInfo,
+        translator,
+        section,
+        volume,
+        volumeCount,
+        tags,
+        wordCount: stats.words,
+        readingMinutes,
+        footnoteCount,
+        hasBilingual,
         frontmatterRaw,
         bodyRaw,
         format,
@@ -334,7 +370,10 @@ function normalizedMarkdown(doc: DocumentModel): string {
 interface TocEntry {
     level: number;
     text: string;
+    html: string;
     id: string;
+    pageNumber: number;
+    pageLabel: string;
 }
 
 function renderMarkdown(markdown: string): string {
@@ -354,17 +393,111 @@ function sanitizeHtml(html: string): string {
 }
 
 function highlightMarks(html: string): string {
-    return html.replace(/==([^=\n<>]{1,240})==/g, '<mark class="book-highlight">$1</mark>');
+    const parts = html.split(/(<pre\b[\s\S]*?<\/pre>|<code\b[\s\S]*?<\/code>)/gi);
+    return parts
+        .map((part, index) =>
+            index % 2 === 1
+                ? part
+                : part.replace(/==([^=\n<>]{1,240})==/g, '<mark class="book-highlight">$1</mark>')
+        )
+        .join('');
 }
 
-function addHeadingIds(html: string, toc: TocEntry[]): string {
+const CALLOUT_LABELS: Record<string, string> = {
+    note: 'یادداشت',
+    info: 'نکتهٔ توضیحی',
+    tip: 'توصیه',
+    hint: 'راهنما',
+    warning: 'هشدار',
+    caution: 'احتیاط',
+    attention: 'توجه',
+    important: 'مهم',
+    danger: 'هشدار جدی',
+    quote: 'نقل‌قول',
+    cite: 'استناد',
+    abstract: 'چکیده',
+    summary: 'خلاصه',
+    question: 'پرسش',
+    example: 'نمونه'
+};
+
+function calloutKind(rawType: string): string {
+    const lower = rawType.toLowerCase();
+    if (lower === 'warning' || lower === 'caution' || lower === 'attention' || lower === 'danger') {
+        return 'warning';
+    }
+    if (lower === 'tip' || lower === 'hint' || lower === 'success') return 'tip';
+    if (lower === 'important') return 'important';
+    if (lower === 'quote' || lower === 'cite') return 'quote';
+    return 'info';
+}
+
+function transformCallouts(html: string): string {
+    return html.replace(/<blockquote>\s*([\s\S]*?)\s*<\/blockquote>/gi, (full, inner: string) => {
+        const match = inner.match(
+            /^\s*<p>\[!([a-zA-Z]+)\](?:[ \t]*([^\n<]*?))?(?:<br\s*\/?>|\n)?([\s\S]*?)<\/p>([\s\S]*)$/i
+        );
+        if (!match) return full;
+        const type = match[1].toLowerCase();
+        const kind = calloutKind(type);
+        const customTitle = plainText(match[2] || '');
+        const title = customTitle || CALLOUT_LABELS[type] || 'یادداشت';
+        const firstBody = (match[3] || '').trim();
+        const restBody = (match[4] || '').trim();
+        const bodyHtml = `${firstBody ? `<p>${firstBody}</p>` : ''}${restBody}`;
+        return (
+            `<aside class="callout callout--${kind}">` +
+            `<div class="callout__head"><span class="callout__dot" aria-hidden="true"></span><span>${escapeHtml(
+                title
+            )}</span></div>` +
+            `<div class="callout__body">${bodyHtml}</div>` +
+            `</aside>`
+        );
+    });
+}
+
+function wrapTables(html: string): string {
+    return html.replace(/<table\b[\s\S]*?<\/table>/gi, (table) => `<div class="table-scroll">${table}</div>`);
+}
+
+function bilingualHeadingHtml(inner: string): string {
+    const origMatch = inner.match(/<span\b[^>]*\bclass=["'][^"']*\bbi-orig\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i);
+    const transMatch = inner.match(/<span\b[^>]*\bclass=["'][^"']*\bbi-trans\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i);
+    if (origMatch && transMatch) {
+        const orig = plainText(origMatch[1]);
+        const trans = plainText(transMatch[1]);
+        return (
+            `<span class="toc-bi">` +
+            `<span class="bi-orig">${escapeHtml(orig)}</span>` +
+            `<span class="bi-trans">${escapeHtml(trans)}</span>` +
+            `</span>`
+        );
+    }
+    return escapeHtml(plainText(inner));
+}
+
+function addHeadingIds(
+    html: string,
+    toc: TocEntry[],
+    pageNumber: number,
+    pageLabel: string
+): string {
     return html.replace(/<h([1-6])>([\s\S]*?)<\/h\1>/g, (_match, levelRaw: string, inner: string) => {
         const level = Number(levelRaw);
         const text = plainText(inner);
         if (!text) return `<h${level}>${inner}</h${level}>`;
         const id = `h-${toc.length + 1}`;
-        if (level <= 3) toc.push({ level, text, id });
-        return `<h${level} id="${id}">${inner}</h${level}>`;
+        if (level <= 3) {
+            toc.push({
+                level,
+                text,
+                html: bilingualHeadingHtml(inner),
+                id,
+                pageNumber,
+                pageLabel
+            });
+        }
+        return `<h${level} id="${id}" data-heading-label="${escapeHtml(text)}">${inner}</h${level}>`;
     });
 }
 
@@ -406,178 +539,1738 @@ function fontCss(): Promise<string> {
 }
 
 function coverHtml(doc: DocumentModel): string {
-    const rows: string[] = [];
-    if (doc.author) rows.push(`<p class="cover__author">${escapeHtml(doc.author)}</p>`);
-    if (doc.translator) rows.push(`<p class="cover__meta">مترجم: ${escapeHtml(doc.translator)}</p>`);
-    if (doc.section) rows.push(`<p class="cover__meta">${escapeHtml(doc.section)}</p>`);
-    if (doc.tags.length) {
-        rows.push(
-            `<p class="cover__tags">${doc.tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join('')}</p>`
-        );
+    const metaItems: string[] = [];
+    if (doc.translator) metaItems.push(`<span>مترجم: ${escapeHtml(doc.translator)}</span>`);
+    if (doc.section) metaItems.push(`<span>بخش: ${escapeHtml(doc.section)}</span>`);
+    if (doc.volume) {
+        const volText = doc.volumeCount
+            ? `جلد ${escapeHtml(toPersianDigits(doc.volume))} از ${escapeHtml(toPersianDigits(doc.volumeCount))}`
+            : `جلد ${escapeHtml(toPersianDigits(doc.volume))}`;
+        metaItems.push(`<span>${volText}</span>`);
     }
+
+    const stats: { label: string; value: string }[] = [
+        { label: 'صفحات', value: toPersianDigits(doc.pages.length) },
+        { label: 'واژگان', value: toPersianDigits(doc.wordCount.toLocaleString('en-US')) }
+    ];
+    if (doc.readingMinutes > 0) {
+        stats.push({ label: 'زمان مطالعه', value: `${toPersianDigits(doc.readingMinutes)} دقیقه` });
+    }
+    if (doc.footnoteCount > 0) {
+        stats.push({ label: 'پاورقی‌ها', value: toPersianDigits(doc.footnoteCount) });
+    }
+
     return (
         `<header class="cover">` +
         `<p class="cover__kicker">کتابخانهٔ فارسی MD</p>` +
         `<h1>${escapeHtml(doc.title)}</h1>` +
-        `<div class="cover__rule"></div>` +
-        rows.join('') +
+        `<div class="cover__rule" aria-hidden="true"></div>` +
+        (doc.author ? `<p class="cover__author">${escapeHtml(doc.author)}</p>` : '') +
+        (doc.authorInfo ? `<p class="cover__author-info">${escapeHtml(doc.authorInfo)}</p>` : '') +
+        (metaItems.length ? `<p class="cover__meta">${metaItems.join(' <span aria-hidden="true">·</span> ')}</p>` : '') +
+        (doc.tags.length
+            ? `<p class="cover__tags">${doc.tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join('')}</p>`
+            : '') +
+        `<dl class="cover__stats">${stats
+            .map((item) => `<div><dt>${item.label}</dt><dd>${item.value}</dd></div>`)
+            .join('')}</dl>` +
         `</header>`
     );
 }
 
 const HTML_STYLES = `
-:root {
+:root,
+html[data-theme="light"] {
     color-scheme: light;
     --ink: #111827;
-    --ink-soft: #334155;
-    --muted: #64748b;
-    --line: #e2e8f0;
-    --accent: #4f46e5;
-    --accent-2: #06b6d4;
+    --ink-soft: #374151;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --line-strong: #d1d5db;
+    --accent: #312e81;
+    --accent-soft: #eef2ff;
+    --accent-ink: #312e81;
     --paper: #ffffff;
-    --page-bg: #f4f6fc;
+    --surface-soft: #f8fafc;
+    --page-bg: #f3f4f6;
+    --bar-bg: rgba(255, 255, 255, 0.92);
+    --mark-bg: #fef08a;
+    --mark-active-bg: #f59e0b;
+    --mark-active-ink: #111827;
+    --code-bg: #f3f4f6;
+    --cover-bg: linear-gradient(155deg, #1e1b4b 0%, #312e81 55%, #0f4c5c 100%);
+    --cover-ink: #f8fafc;
+    --shadow-card: 0 18px 44px -34px rgba(15, 23, 42, 0.25);
+    --reader-size: 16.5px;
+    --reader-leading: 2.02;
+    --reader-measure: 820px;
+}
+html[data-theme="sepia"] {
+    color-scheme: light;
+    --ink: #292118;
+    --ink-soft: #4a3d2f;
+    --muted: #786958;
+    --line: #dfd5c3;
+    --line-strong: #c9bca5;
+    --accent: #7c3f1d;
+    --accent-soft: #f2e6d5;
+    --accent-ink: #6b3416;
+    --paper: #faf6ed;
+    --surface-soft: #f3ede0;
+    --page-bg: #efe8d8;
+    --bar-bg: rgba(250, 246, 237, 0.94);
+    --mark-bg: #fde68a;
+    --mark-active-bg: #d97706;
+    --mark-active-ink: #ffffff;
+    --code-bg: #efe6d6;
+    --cover-bg: linear-gradient(155deg, #3b2314 0%, #5b341c 58%, #2e3b2f 100%);
+    --cover-ink: #fbf7ef;
+    --shadow-card: 0 18px 44px -34px rgba(41, 33, 24, 0.24);
+}
+html[data-theme="dark"] {
+    color-scheme: dark;
+    --ink: #e5e7eb;
+    --ink-soft: #cbd5e1;
+    --muted: #94a3b8;
+    --line: #272e3f;
+    --line-strong: #374151;
+    --accent: #a5b4fc;
+    --accent-soft: rgba(99, 102, 241, 0.16);
+    --accent-ink: #c7d2fe;
+    --paper: #161922;
+    --surface-soft: #1d222e;
+    --page-bg: #0e1017;
+    --bar-bg: rgba(22, 25, 34, 0.92);
+    --mark-bg: rgba(250, 204, 21, 0.34);
+    --mark-active-bg: #f59e0b;
+    --mark-active-ink: #111827;
+    --code-bg: #1f2533;
+    --cover-bg: linear-gradient(155deg, #111428 0%, #1e1b4b 58%, #0d2b36 100%);
+    --cover-ink: #f1f5f9;
+    --shadow-card: 0 22px 50px -34px rgba(0, 0, 0, 0.65);
 }
 * { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { transition: none !important; animation: none !important; }
+}
 body {
     margin: 0;
-    padding: 30px 18px 64px;
-    background: linear-gradient(180deg, #eef1fb 0, #f7f9fd 260px) no-repeat, var(--page-bg);
+    padding: 0 18px 80px;
+    background: var(--page-bg);
     color: var(--ink);
     font-family: 'VazirmatnBook', Vazirmatn, Tahoma, 'Segoe UI', 'Iranian Sans', sans-serif;
-    font-size: 12pt;
-    line-height: 2.05;
+    font-size: var(--reader-size);
+    line-height: var(--reader-leading);
     text-align: justify;
     word-spacing: -0.01em;
     -webkit-print-color-adjust: exact;
     print-color-adjust: exact;
 }
+html[data-align="start"] body { text-align: start; }
+html[data-bilingual="translated"] .bi-orig { display: none !important; }
+html[data-bilingual="original"] .bi-trans { display: none !important; }
+html[data-orig-font="traditional"] .bi-orig {
+    font-family: 'Traditional Arabic', 'Amiri', 'Scheherazade New', 'Times New Roman', serif;
+    font-size: 1.06em;
+    line-height: 2.15;
+}
+html[data-focus="true"] .reader-bar,
+html[data-focus="true"] .toc-drawer,
+html[data-focus="true"] .drawer-backdrop,
+html[data-focus="true"] .resume-banner { display: none !important; }
+
+/* Progress track */
+.progress-track {
+    position: fixed;
+    top: 0;
+    inset-inline: 0;
+    height: 3px;
+    z-index: 60;
+    background: transparent;
+    pointer-events: none;
+}
+.progress-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    transition: width 120ms linear;
+}
+
+/* Sticky 3-zone reader bar */
+.reader-bar {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    margin: 0 -18px 24px;
+    padding: 10px 18px;
+    background: var(--bar-bg);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line);
+}
+.reader-bar__inner {
+    max-width: 1180px;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+.reader-bar__start,
+.reader-bar__center,
+.reader-bar__end {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+.reader-bar__start { flex: 1 1 180px; }
+.reader-bar__center { flex: 2 1 320px; justify-content: center; flex-wrap: wrap; }
+.reader-bar__end { flex: 1 1 auto; justify-content: flex-end; flex-wrap: wrap; }
+.bar-title {
+    margin: 0;
+    font-size: 0.92rem;
+    font-weight: 700;
+    color: var(--ink);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.bar-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 34px;
+    padding: 0 11px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--paper);
+    color: var(--ink-soft);
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 600;
+    line-height: 1;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+.bar-btn:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface-soft); }
+.bar-btn[aria-pressed="true"],
+.bar-btn.is-active {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+}
+.bar-btn--icon { width: 34px; padding: 0; }
+.bar-btn:focus-visible,
+.bar-input:focus-visible,
+.toc-filter:focus-visible,
+.page-jump__input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.segmented {
+    display: inline-flex;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--surface-soft);
+    padding: 2px;
+    gap: 2px;
+    flex-shrink: 0;
+}
+.segmented button {
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 5px 9px;
+    border-radius: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.segmented button[aria-pressed="true"] {
+    background: var(--paper);
+    color: var(--ink);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.search-box {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 34px;
+    padding: 0 6px 0 8px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--paper);
+    min-width: 210px;
+    flex: 1 1 220px;
+    max-width: 340px;
+}
+.bar-input {
+    border: 0;
+    background: transparent;
+    color: var(--ink);
+    font: inherit;
+    font-size: 0.84rem;
+    width: 100%;
+    min-width: 0;
+    outline: none;
+}
+.search-count {
+    font-size: 0.76rem;
+    color: var(--muted);
+    white-space: nowrap;
+    padding: 0 4px;
+    font-variant-numeric: tabular-nums;
+}
+.search-nav {
+    border: 0;
+    background: transparent;
+    color: var(--ink-soft);
+    width: 24px;
+    height: 24px;
+    border-radius: 5px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.78rem;
+    display: inline-grid;
+    place-items: center;
+}
+.search-nav:hover:not(:disabled) { background: var(--surface-soft); color: var(--ink); }
+.search-nav:disabled { opacity: 0.35; cursor: default; }
+
+.page-jump {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 34px;
+    padding: 0 8px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--paper);
+    font-size: 0.8rem;
+    color: var(--muted);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+.page-jump__input {
+    width: 44px;
+    height: 24px;
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    background: var(--surface-soft);
+    color: var(--ink);
+    font: inherit;
+    font-size: 0.8rem;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Settings popover */
+.settings-wrap { position: relative; }
+.settings-popover {
+    position: absolute;
+    top: calc(100% + 8px);
+    inset-inline-end: 0;
+    width: 292px;
+    padding: 14px;
+    border-radius: 12px;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    box-shadow: 0 20px 48px -18px rgba(0, 0, 0, 0.28);
+    z-index: 70;
+    display: none;
+    text-align: start;
+}
+.settings-popover.is-open { display: block; }
+.settings-row { margin-bottom: 12px; }
+.settings-row:last-child { margin-bottom: 0; }
+.settings-label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--muted);
+    margin-bottom: 6px;
+}
+.settings-grid { display: flex; gap: 6px; flex-wrap: wrap; }
+.settings-grid button {
+    flex: 1 1 auto;
+    height: 30px;
+    padding: 0 8px;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    background: var(--surface-soft);
+    color: var(--ink-soft);
+    font: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+}
+.settings-grid button[aria-pressed="true"] {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    font-weight: 700;
+}
+
+/* TOC & Bookmarks Drawer */
+.drawer-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.36);
+    z-index: 50;
+    display: none;
+}
+.drawer-backdrop.is-open { display: block; }
+.toc-drawer {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    inset-inline-start: 0;
+    width: min(360px, 90vw);
+    background: var(--paper);
+    border-inline-end: 1px solid var(--line);
+    z-index: 55;
+    display: flex;
+    flex-direction: column;
+    transform: translateX(105%);
+    transition: transform 180ms ease;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+}
+.toc-drawer.is-open { transform: translateX(0); }
+.toc-drawer__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--line);
+}
+.toc-drawer__tabs { display: flex; gap: 6px; }
+.toc-drawer__tabs button {
+    border: 1px solid var(--line);
+    background: var(--surface-soft);
+    color: var(--muted);
+    font: inherit;
+    font-size: 0.8rem;
+    font-weight: 600;
+    padding: 5px 10px;
+    border-radius: 7px;
+    cursor: pointer;
+}
+.toc-drawer__tabs button[aria-selected="true"] {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+}
+.toc-drawer__search { padding: 10px 16px; border-bottom: 1px solid var(--line); }
+.toc-filter {
+    width: 100%;
+    height: 34px;
+    padding: 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--surface-soft);
+    color: var(--ink);
+    font: inherit;
+    font-size: 0.84rem;
+}
+.toc-drawer__body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 12px 24px;
+    text-align: start;
+}
+.drawer-list { list-style: none; margin: 0; padding: 0; }
+.drawer-list li { margin: 2px 0; }
+.drawer-list li.is-level-2 { padding-inline-start: 14px; }
+.drawer-list li.is-level-3 { padding-inline-start: 28px; }
+.drawer-list a {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 6px 10px;
+    border-radius: 7px;
+    color: var(--ink-soft);
+    text-decoration: none;
+    font-size: 0.86rem;
+    line-height: 1.6;
+}
+.drawer-list a:hover { background: var(--surface-soft); color: var(--ink); }
+.drawer-list a.is-current {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    font-weight: 700;
+}
+.drawer-list .toc-pg {
+    font-size: 0.74rem;
+    color: var(--muted);
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+}
+.drawer-empty {
+    padding: 28px 14px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.88rem;
+}
+
+/* Resume reading prompt */
+.resume-banner {
+    max-width: var(--reader-measure);
+    margin: 0 auto 18px;
+    padding: 10px 14px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--paper);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 0.88rem;
+    color: var(--ink-soft);
+}
+.resume-banner__actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+/* AutoPrint fallback banner */
+.banner {
+    max-width: var(--reader-measure);
+    margin: 18px auto 22px;
+    padding: 14px 18px;
+    border: 1px solid var(--line);
+    background: var(--accent-soft);
+    border-radius: 12px;
+    color: var(--accent-ink);
+    font-size: 0.92rem;
+    line-height: 1.9;
+}
+.banner strong { display: block; margin-bottom: 4px; }
+
+/* Cover */
 .cover {
     position: relative;
-    max-width: 190mm;
-    margin: 0 auto 26px;
-    padding: 76px 44px 60px;
-    border-radius: 26px;
+    max-width: var(--reader-measure);
+    margin: 18px auto 26px;
+    padding: 64px 40px 44px;
+    border-radius: 18px;
     overflow: hidden;
     text-align: center;
-    background: linear-gradient(140deg, #312e81 0%, #4338ca 46%, #0e7490 100%);
-    color: #f8fafc;
+    background: var(--cover-bg);
+    color: var(--cover-ink);
+    border: 1px solid rgba(255, 255, 255, 0.14);
     break-after: page;
     page-break-after: always;
 }
-.cover::before {
-    content: '';
-    position: absolute;
-    top: -180px;
-    inset-inline-start: -120px;
-    width: 420px;
-    height: 420px;
-    border-radius: 50%;
-    background: radial-gradient(circle, rgba(34, 211, 238, 0.45), transparent 66%);
+.cover__kicker {
+    margin: 0 0 22px;
+    color: rgba(248, 250, 252, 0.76);
+    font-size: 0.82rem;
+    letter-spacing: 0.12em;
 }
-.cover::after {
-    content: '';
-    position: absolute;
-    bottom: -220px;
-    inset-inline-end: -140px;
-    width: 420px;
-    height: 420px;
-    border-radius: 50%;
-    background: radial-gradient(circle, rgba(167, 139, 250, 0.4), transparent 66%);
+.cover h1 {
+    margin: 0 0 18px;
+    padding-bottom: 0;
+    border-bottom: 0;
+    font-size: clamp(1.75rem, 3.2vw, 2.5rem);
+    line-height: 1.5;
+    color: #ffffff;
+    text-align: center;
 }
-.cover > * { position: relative; }
-.cover__kicker { margin: 0 0 30px; color: rgba(248, 250, 252, 0.72); font-size: 10pt; letter-spacing: 0.14em; }
-.cover h1 { margin: 0 0 22px; padding-bottom: 0; border-bottom: 0; font-size: 30pt; line-height: 1.5; color: #ffffff; letter-spacing: -0.01em; }
-.cover__rule { width: 68px; height: 3px; margin: 0 auto 24px; border-radius: 999px; background: linear-gradient(90deg, #22d3ee, #a78bfa); }
-.cover__author { margin: 0 0 10px; font-size: 15pt; color: rgba(248, 250, 252, 0.94); }
-.cover__meta { margin: 4px 0; color: rgba(248, 250, 252, 0.72); font-size: 11pt; }
-.cover__tags { margin: 24px 0 0; display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
-.cover__tags span { padding: 4px 12px; border: 1px solid rgba(255, 255, 255, 0.28); background: rgba(255, 255, 255, 0.1); border-radius: 999px; font-size: 9.5pt; color: #f1f5f9; }
+.cover__rule {
+    width: 64px;
+    height: 2px;
+    margin: 0 auto 20px;
+    background: rgba(255, 255, 255, 0.45);
+}
+.cover__author { margin: 0 0 8px; font-size: 1.15rem; font-weight: 700; color: rgba(255, 255, 255, 0.96); }
+.cover__author-info {
+    margin: 0 auto 12px;
+    max-width: 62ch;
+    font-size: 0.88rem;
+    line-height: 1.85;
+    color: rgba(248, 250, 252, 0.78);
+}
+.cover__meta { margin: 4px 0; color: rgba(248, 250, 252, 0.8); font-size: 0.9rem; }
+.cover__tags {
+    margin: 20px 0 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: center;
+}
+.cover__tags span {
+    padding: 3px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.26);
+    border-radius: 4px;
+    font-size: 0.8rem;
+    color: rgba(248, 250, 252, 0.92);
+}
+.cover__stats {
+    margin: 28px auto 0;
+    padding-top: 18px;
+    border-top: 1px solid rgba(255, 255, 255, 0.18);
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 12px;
+    max-width: 560px;
+}
+.cover__stats dt { font-size: 0.74rem; color: rgba(248, 250, 252, 0.68); margin: 0 0 2px; }
+.cover__stats dd { margin: 0; font-size: 0.98rem; font-weight: 700; color: #ffffff; font-variant-numeric: tabular-nums; }
+
+/* Printable Document TOC */
 .toc {
-    max-width: 172mm;
+    max-width: var(--reader-measure);
     margin: 0 auto 26px;
-    padding: 28px 30px 24px;
+    padding: 28px 34px 24px;
     background: var(--paper);
     border: 1px solid var(--line);
-    border-radius: 20px;
-    box-shadow: 0 18px 44px -34px rgba(15, 23, 42, 0.45);
+    border-radius: 14px;
+    box-shadow: var(--shadow-card);
     break-after: page;
     page-break-after: always;
 }
-.toc h2 { display: flex; align-items: center; gap: 10px; margin: 0 0 16px; font-size: 16pt; color: #1e1b4b; }
-.toc h2::before { content: ''; width: 22px; height: 4px; border-radius: 99px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+.toc h2 {
+    margin: 0 0 16px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--line);
+    font-size: 1.25rem;
+    color: var(--ink);
+}
 .toc ol { list-style: none; margin: 0; padding: 0; }
-.toc li { margin: 0; font-size: 11.5pt; line-height: 1.85; }
-.toc li.is-level-2 { margin-inline-start: 18px; font-size: 11pt; }
-.toc li.is-level-3 { margin-inline-start: 36px; font-size: 10.5pt; }
-.toc a { display: flex; align-items: baseline; gap: 9px; padding: 5px 8px; border-radius: 9px; color: #1e293b; text-decoration: none; }
-.toc a::before { content: ''; flex: none; width: 6px; height: 6px; border-radius: 50%; background: #c7d2fe; transform: translateY(-2px); }
-.toc li.is-level-1 > a::before { background: linear-gradient(135deg, #6366f1, #22d3ee); }
-.toc li.is-level-1 > a { font-weight: 700; }
-.toc a:hover { background: #eef2ff; color: var(--accent); }
+.toc li { margin: 0; font-size: 0.95rem; line-height: 1.9; }
+.toc li.is-level-2 { margin-inline-start: 18px; font-size: 0.91rem; }
+.toc li.is-level-3 { margin-inline-start: 36px; font-size: 0.87rem; }
+.toc a {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    color: var(--ink-soft);
+    text-decoration: none;
+}
+.toc li.is-level-1 > a { font-weight: 700; color: var(--ink); }
+.toc a:hover { background: var(--surface-soft); color: var(--accent); }
+.toc__pg { font-size: 0.78rem; color: var(--muted); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+
+/* Page Surface */
 .page {
     position: relative;
-    max-width: 190mm;
+    max-width: var(--reader-measure);
     margin: 0 auto 24px;
-    padding: 34px 40px 38px;
+    padding: 28px 40px 38px;
     background: var(--paper);
     border: 1px solid var(--line);
-    border-radius: 20px;
-    box-shadow: 0 20px 50px -40px rgba(15, 23, 42, 0.5);
+    border-radius: 14px;
+    box-shadow: var(--shadow-card);
     break-after: page;
     page-break-after: always;
 }
-.page::before { content: ''; position: absolute; inset-inline: 0; top: 0; height: 4px; border-radius: 20px 20px 0 0; background: linear-gradient(90deg, #6366f1, #22d3ee); opacity: 0.75; }
 .page:last-of-type { break-after: auto; page-break-after: auto; }
-.page-marker { width: fit-content; margin: 0 auto 18px; padding: 3px 14px; border-radius: 999px; background: #eef2ff; color: #4338ca; font-size: 9.5pt; font-weight: 700; }
-h1, h2, h3, h4, h5, h6 { line-height: 1.6; color: #0f172a; margin: 1.15em 0 0.55em; text-align: start; }
-h1 { font-size: 21pt; color: #312e81; padding-bottom: 0.3em; border-bottom: 1px solid var(--line); }
-h2 { font-size: 17pt; color: #1e1b4b; padding-inline-start: 0.55em; border-inline-start: 4px solid var(--accent); }
-h3 { font-size: 14.5pt; color: #0e7490; }
-h4 { font-size: 13pt; } h5 { font-size: 12pt; } h6 { font-size: 11pt; color: var(--ink-soft); }
-p { margin: 0 0 0.75em; }
-a { color: #1d4ed8; text-underline-offset: 3px; }
+.page__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding-bottom: 12px;
+    margin-bottom: 18px;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.82rem;
+    color: var(--muted);
+}
+.page__marker {
+    font-weight: 700;
+    color: var(--accent-ink);
+    font-variant-numeric: tabular-nums;
+}
+.page__actions { display: inline-flex; align-items: center; gap: 6px; }
+.page-act {
+    border: 1px solid var(--line);
+    background: var(--surface-soft);
+    color: var(--muted);
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+.page-act:hover { color: var(--ink); border-color: var(--line-strong); }
+.page-act[aria-pressed="true"] {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+}
+
+/* Typography */
+h1, h2, h3, h4, h5, h6 {
+    line-height: 1.55;
+    color: var(--ink);
+    margin: 1.2em 0 0.55em;
+    text-align: start;
+    scroll-margin-top: 76px;
+}
+h1 { font-size: 1.65em; padding-bottom: 0.3em; border-bottom: 1px solid var(--line); }
+h2 { font-size: 1.35em; padding-bottom: 0.2em; border-bottom: 1px solid var(--line); }
+h3 { font-size: 1.15em; color: var(--accent-ink); }
+h4 { font-size: 1.05em; }
+h5 { font-size: 0.98em; }
+h6 { font-size: 0.92em; color: var(--muted); }
+p { margin: 0 0 0.8em; }
+a { color: var(--accent-ink); text-underline-offset: 3px; }
 ul, ol { margin: 0 0 0.85em; padding-inline-start: 22px; }
-li { margin: 0.18em 0; }
-li::marker { color: var(--accent); }
-blockquote { margin: 1em 0; padding: 12px 18px; border-inline-start: 3px solid var(--accent-2); border-radius: 0 12px 12px 0; color: var(--ink-soft); background: #f8fafc; }
+li { margin: 0.2em 0; }
+li::marker { color: var(--muted); }
+blockquote {
+    margin: 1em 0;
+    padding: 12px 18px;
+    border: 1px solid var(--line);
+    border-inline-start: 2px solid var(--line-strong);
+    border-radius: 8px;
+    color: var(--ink-soft);
+    background: var(--surface-soft);
+}
 blockquote p:last-child { margin-bottom: 0; }
-code { font-family: 'Cascadia Mono', Consolas, monospace; background: #f1f5f9; padding: 0 4px; border-radius: 4px; font-size: 0.9em; }
-pre { background: #f8fafc; border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; overflow: auto; direction: ltr; text-align: left; line-height: 1.7; }
+
+/* Callouts */
+.callout {
+    margin: 1.1em 0;
+    padding: 12px 16px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--surface-soft);
+}
+.callout__head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+    font-size: 0.88em;
+    font-weight: 700;
+    color: var(--accent-ink);
+}
+.callout__dot { width: 8px; height: 8px; border-radius: 2px; background: currentColor; }
+.callout--warning .callout__head { color: #b45309; }
+html[data-theme="dark"] .callout--warning .callout__head { color: #fbbf24; }
+.callout--tip .callout__head { color: #047857; }
+html[data-theme="dark"] .callout--tip .callout__head { color: #34d399; }
+.callout__body p:last-child { margin-bottom: 0; }
+
+code {
+    font-family: 'Cascadia Mono', Consolas, ui-monospace, monospace;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 0.88em;
+}
+.pre-wrap { position: relative; margin: 1em 0; }
+pre {
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin: 0;
+    overflow: auto;
+    direction: ltr;
+    text-align: left;
+    line-height: 1.65;
+}
 pre code { background: none; padding: 0; }
-table { width: 100%; border-collapse: collapse; margin: 1em 0; font-size: 10.5pt; border: 1px solid var(--line); }
-th, td { border-bottom: 1px solid var(--line); border-inline-start: 1px solid var(--line); padding: 8px 11px; text-align: start; vertical-align: top; }
+.code-copy {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    border: 1px solid var(--line);
+    background: var(--paper);
+    color: var(--muted);
+    font: inherit;
+    font-size: 0.72rem;
+    padding: 3px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+.code-copy:hover { color: var(--ink); }
+
+.table-scroll { overflow-x: auto; margin: 1em 0; border-radius: 8px; border: 1px solid var(--line); }
+table { width: 100%; border-collapse: collapse; margin: 0; font-size: 0.9em; }
+th, td {
+    border-bottom: 1px solid var(--line);
+    border-inline-start: 1px solid var(--line);
+    padding: 8px 12px;
+    text-align: start;
+    vertical-align: top;
+}
 th:first-child, td:first-child { border-inline-start: none; }
-th { background: #eef2ff; color: #312e81; font-weight: 700; }
-tbody tr:nth-child(even) td { background: #f8fafc; }
-img { max-width: 100%; height: auto; border-radius: 10px; }
-mark.book-highlight { background: #fef3c7; color: inherit; padding: 0 3px; border-radius: 4px; }
-hr { border: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--line) 20%, var(--line) 80%, transparent); margin: 1.5em 0; }
-sup.fn-ref a { display: inline-block; min-width: 1.4em; padding: 0 4px; border-radius: 5px; background: #eef2ff; color: var(--accent); text-decoration: none; font-size: 0.72em; font-weight: 700; text-align: center; }
-.footnotes { margin-top: 26px; padding-top: 16px; border-top: 1px dashed var(--line); font-size: 9.8pt; color: var(--ink-soft); }
-.footnotes h4 { margin: 0 0 10px; font-size: 11pt; color: var(--accent); }
+tbody tr:last-child td { border-bottom: 0; }
+th { background: var(--accent-soft); color: var(--accent-ink); font-weight: 700; }
+tbody tr:nth-child(even) td { background: var(--surface-soft); }
+
+.page img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 8px;
+    cursor: zoom-in;
+    border: 1px solid var(--line);
+}
+mark.book-highlight { background: var(--mark-bg); color: #111827; padding: 0 3px; border-radius: 3px; }
+mark.search-hit { background: var(--mark-bg); color: #111827; padding: 0 2px; border-radius: 3px; }
+mark.search-hit.is-active { background: var(--mark-active-bg); color: var(--mark-active-ink); box-shadow: 0 0 0 2px var(--mark-active-bg); }
+hr { border: 0; height: 1px; background: var(--line); margin: 1.5em 0; }
+
+/* Bilingual blocks */
+.bi-orig {
+    display: block;
+    color: var(--muted);
+    font-size: 0.92em;
+    padding-inline-start: 10px;
+    border-inline-start: 1px solid var(--line-strong);
+    margin-bottom: 5px;
+}
+.bi-trans {
+    display: block;
+    color: var(--ink);
+    background: var(--surface-soft);
+    padding: 5px 10px;
+    border-radius: 6px;
+}
+h1 .bi-orig, h2 .bi-orig, h3 .bi-orig, .toc .bi-orig, .toc-drawer .bi-orig {
+    font-size: 0.85em;
+    margin-bottom: 2px;
+    border-inline-start: none;
+    padding-inline-start: 0;
+}
+.toc .bi-trans, .toc-drawer .bi-trans {
+    background: transparent;
+    padding: 0;
+}
+
+/* Footnotes & interactive popover */
+sup.fn-ref a {
+    display: inline-block;
+    min-width: 1.4em;
+    padding: 0 4px;
+    border-radius: 4px;
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    text-decoration: none;
+    font-size: 0.72em;
+    font-weight: 700;
+    text-align: center;
+}
+sup.fn-ref.is-flash a { outline: 2px solid var(--accent); }
+.footnotes {
+    margin-top: 26px;
+    padding-top: 16px;
+    border-top: 1px dashed var(--line-strong);
+    font-size: 0.86em;
+    color: var(--ink-soft);
+}
+.footnotes h4 { margin: 0 0 10px; font-size: 0.95em; color: var(--accent-ink); }
 .footnotes ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 7px; }
-.footnotes li { display: flex; align-items: flex-start; gap: 8px; padding: 8px 11px; background: #f8fafc; border: 1px solid var(--line); border-radius: 10px; line-height: 1.9; }
-.footnotes .fn-num { flex: none; width: 22px; height: 22px; display: inline-grid; place-items: center; border-radius: 7px; background: #ffffff; border: 1px solid var(--line); color: var(--accent); font-weight: 800; font-size: 9pt; }
-.fn-back { flex: none; margin-inline-start: auto; text-decoration: none; color: var(--accent); opacity: 0.7; }
-.banner { max-width: 760px; margin: 0 auto 22px; padding: 14px 18px; border: 1px solid #c7d2fe; background: #eef2ff; border-radius: 14px; color: #312e81; font-size: 10.5pt; line-height: 1.9; }
-.banner strong { display: block; margin-bottom: 4px; color: #1e1b4b; }
+.footnotes li {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 11px;
+    background: var(--surface-soft);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    line-height: 1.85;
+}
+.footnotes li.is-flash { border-color: var(--accent); background: var(--accent-soft); }
+.footnotes .fn-num {
+    flex: none;
+    min-width: 22px;
+    height: 22px;
+    padding: 0 4px;
+    display: inline-grid;
+    place-items: center;
+    border-radius: 6px;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    color: var(--accent-ink);
+    font-weight: 700;
+    font-size: 0.82em;
+}
+.fn-back { flex: none; margin-inline-start: auto; text-decoration: none; color: var(--accent-ink); opacity: 0.75; }
+.fn-back:hover { opacity: 1; }
+
+.fn-popover {
+    position: fixed;
+    z-index: 75;
+    max-width: min(400px, calc(100vw - 24px));
+    padding: 12px 14px;
+    border-radius: 10px;
+    background: var(--paper);
+    border: 1px solid var(--line-strong);
+    box-shadow: 0 20px 44px -14px rgba(0, 0, 0, 0.32);
+    font-size: 0.88rem;
+    line-height: 1.85;
+    color: var(--ink);
+    display: none;
+    text-align: start;
+}
+.fn-popover.is-open { display: block; }
+.fn-popover__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 6px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--accent-ink);
+}
+.fn-popover__body p:last-child { margin-bottom: 0; }
+.fn-popover__foot { margin-top: 8px; display: flex; justify-content: flex-end; gap: 8px; }
+
+/* Image lightbox */
+.lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+    background: rgba(10, 12, 18, 0.88);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+}
+.lightbox.is-open { display: flex; }
+.lightbox img { max-width: 94vw; max-height: 88vh; border-radius: 8px; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5); }
+.lightbox__close {
+    position: fixed;
+    top: 16px;
+    inset-inline-end: 16px;
+}
+
+/* Floating controls & toast */
+.fab-top {
+    position: fixed;
+    bottom: 20px;
+    inset-inline-end: 20px;
+    z-index: 35;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 160ms ease;
+}
+.fab-top.is-visible { opacity: 1; pointer-events: auto; }
+.focus-exit {
+    position: fixed;
+    top: 14px;
+    inset-inline-end: 16px;
+    z-index: 45;
+    display: none;
+}
+html[data-focus="true"] .focus-exit { display: inline-flex; }
+.toast-msg {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%) translateY(16px);
+    padding: 8px 16px;
+    border-radius: 8px;
+    background: var(--ink);
+    color: var(--paper);
+    font-size: 0.84rem;
+    font-weight: 600;
+    z-index: 90;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 150ms ease, transform 150ms ease;
+}
+.toast-msg.is-open { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+@media (max-width: 720px) {
+    body { padding: 0 10px 70px; }
+    .reader-bar { margin: 0 -10px 16px; padding: 8px 10px; }
+    .page, .toc { padding: 20px 18px 26px; }
+    .cover { padding: 44px 20px 32px; }
+    .bar-title { max-width: 140px; }
+}
+
 @media print {
-    html, body { background: #ffffff; }
-    body { padding: 0; font-size: 11pt; }
+    html,
+    html[data-theme="sepia"],
+    html[data-theme="dark"] {
+        color-scheme: light !important;
+        --ink: #111827 !important;
+        --ink-soft: #334155 !important;
+        --muted: #64748b !important;
+        --line: #e2e8f0 !important;
+        --line-strong: #cbd5e1 !important;
+        --accent: #312e81 !important;
+        --accent-soft: #eef2ff !important;
+        --accent-ink: #312e81 !important;
+        --paper: #ffffff !important;
+        --surface-soft: #f8fafc !important;
+        --page-bg: #ffffff !important;
+        --code-bg: #f8fafc !important;
+    }
+    html, body { background: #ffffff !important; color: #111827 !important; }
+    body { padding: 0; font-size: 11pt; line-height: 1.95; }
     .no-print { display: none !important; }
-    .cover, .toc, .page { max-width: none; margin: 0; border: none; border-radius: 0; box-shadow: none; padding: 0; }
-    .cover { padding: 34mm 14mm; }
+    .cover, .toc, .page {
+        max-width: none;
+        margin: 0;
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+        padding: 0;
+    }
+    .cover { padding: 34mm 14mm; border: none; }
     .toc { padding: 0 0 10mm; }
     .page { break-after: page; page-break-after: always; }
-    .page::before { display: none; }
+    .page__head { border-bottom-color: #e2e8f0; margin-bottom: 14px; padding-bottom: 8px; }
     a { color: inherit; text-decoration: none; }
     h1, h2, h3, h4 { break-after: avoid; page-break-after: avoid; }
-    table, pre, blockquote, .footnotes li { break-inside: avoid; page-break-inside: avoid; }
+    table, pre, blockquote, .callout, .footnotes li { break-inside: avoid; page-break-inside: avoid; }
+    .table-scroll { overflow: visible; border: none; }
     thead { display: table-header-group; }
     th { background: #eef2ff !important; }
 }
 @page { size: A4; margin: 18mm 16mm 20mm; }
 `;
+
+interface HtmlMetaPayload {
+    bookKey: string;
+    title: string;
+    author: string;
+    totalPages: number;
+    hasBilingual: boolean;
+}
+
+const HTML_READER_SCRIPT = `(function () {
+    var metaEl = document.getElementById('book-meta');
+    var meta = { bookKey: 'book', title: document.title, author: '', totalPages: 1, hasBilingual: false };
+    try {
+        if (metaEl) meta = JSON.parse(metaEl.textContent || '{}');
+    } catch (_) {}
+
+    var root = document.documentElement;
+    var STORAGE_PREFS = 'mdbook-reader-prefs-v1';
+    var STORAGE_BOOK = 'mdbook-state:' + String(meta.bookKey || 'book');
+    var PERSIAN_DIGITS = '۰۱۲۳۴۵۶۷۸۹';
+
+    function toFa(n) {
+        return String(n).replace(/\\d/g, function (d) { return PERSIAN_DIGITS[Number(d)] || d; });
+    }
+    function normalizeDigits(s) {
+        return String(s || '').replace(/[\\u06F0-\\u06F9]/g, function (d) {
+            return String(d.charCodeAt(0) - 0x06f0);
+        });
+    }
+    function safeGet(key) {
+        try { return window.localStorage.getItem(key); } catch (_) { return null; }
+    }
+    function safeSet(key, value) {
+        try { window.localStorage.setItem(key, value); } catch (_) {}
+    }
+
+    var prefs = {
+        theme: 'light',
+        bilingual: 'both',
+        fontSize: 16.5,
+        lineHeight: 2.02,
+        measure: 820,
+        align: 'justify',
+        origFont: 'sans'
+    };
+    try {
+        var savedPrefs = safeGet(STORAGE_PREFS);
+        if (savedPrefs) {
+            var parsedPrefs = JSON.parse(savedPrefs);
+            if (parsedPrefs && typeof parsedPrefs === 'object') {
+                Object.assign(prefs, parsedPrefs);
+            }
+        }
+    } catch (_) {}
+
+    var bookState = { page: 1, bookmarks: [] };
+    try {
+        var savedBook = safeGet(STORAGE_BOOK);
+        if (savedBook) {
+            var parsedBook = JSON.parse(savedBook);
+            if (parsedBook && typeof parsedBook === 'object') {
+                if (typeof parsedBook.page === 'number') bookState.page = parsedBook.page;
+                if (Array.isArray(parsedBook.bookmarks)) bookState.bookmarks = parsedBook.bookmarks;
+            }
+        }
+    } catch (_) {}
+
+    var toastTimer = null;
+    var toastEl = document.getElementById('toast-msg');
+    function showToast(msg) {
+        if (!toastEl) return;
+        toastEl.textContent = msg;
+        toastEl.classList.add('is-open');
+        if (toastTimer) clearTimeout(toastTimer);
+        toastTimer = setTimeout(function () {
+            toastEl.classList.remove('is-open');
+        }, 2000);
+    }
+
+    function applyPrefs() {
+        root.setAttribute('data-theme', prefs.theme);
+        root.setAttribute('data-bilingual', prefs.bilingual);
+        root.setAttribute('data-align', prefs.align);
+        root.setAttribute('data-orig-font', prefs.origFont);
+        root.style.setProperty('--reader-size', prefs.fontSize + 'px');
+        root.style.setProperty('--reader-leading', String(prefs.lineHeight));
+        root.style.setProperty('--reader-measure', prefs.measure + 'px');
+
+        document.querySelectorAll('[data-set-theme]').forEach(function (btn) {
+            btn.setAttribute('aria-pressed', String(btn.getAttribute('data-set-theme') === prefs.theme));
+        });
+        document.querySelectorAll('[data-set-bi]').forEach(function (btn) {
+            btn.setAttribute('aria-pressed', String(btn.getAttribute('data-set-bi') === prefs.bilingual));
+        });
+        document.querySelectorAll('[data-set-leading]').forEach(function (btn) {
+            btn.setAttribute('aria-pressed', String(Number(btn.getAttribute('data-set-leading')) === prefs.lineHeight));
+        });
+        document.querySelectorAll('[data-set-measure]').forEach(function (btn) {
+            btn.setAttribute('aria-pressed', String(Number(btn.getAttribute('data-set-measure')) === prefs.measure));
+        });
+        document.querySelectorAll('[data-set-align]').forEach(function (btn) {
+            btn.setAttribute('aria-pressed', String(btn.getAttribute('data-set-align') === prefs.align));
+        });
+        document.querySelectorAll('[data-set-orig-font]').forEach(function (btn) {
+            btn.setAttribute('aria-pressed', String(btn.getAttribute('data-set-orig-font') === prefs.origFont));
+        });
+        var sizeLabel = document.getElementById('font-size-val');
+        if (sizeLabel) sizeLabel.textContent = toFa(Math.round(prefs.fontSize)) + 'px';
+        safeSet(STORAGE_PREFS, JSON.stringify(prefs));
+    }
+
+    function saveBookState() {
+        safeSet(STORAGE_BOOK, JSON.stringify(bookState));
+    }
+
+    var pages = Array.prototype.slice.call(document.querySelectorAll('.page'));
+    var currentPage = 1;
+    var pageInput = document.getElementById('page-jump-input');
+
+    function setCurrentPage(num) {
+        if (num < 1 || num > pages.length) return;
+        currentPage = num;
+        if (pageInput && document.activeElement !== pageInput) {
+            pageInput.value = String(num);
+        }
+        bookState.page = num;
+        saveBookState();
+    }
+
+    function goToPage(num) {
+        var idx = Math.max(1, Math.min(pages.length, Number(num) || 1));
+        var target = pages[idx - 1];
+        if (!target) return;
+        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        setCurrentPage(idx);
+    }
+
+    /* Resume banner */
+    var resumeBanner = document.getElementById('resume-banner');
+    var resumeBtn = document.getElementById('resume-go');
+    var resumeDismiss = document.getElementById('resume-dismiss');
+    if (resumeBanner && bookState.page > 1 && bookState.page <= pages.length) {
+        var resumeLabel = document.getElementById('resume-page-label');
+        if (resumeLabel) resumeLabel.textContent = toFa(bookState.page);
+        resumeBanner.hidden = false;
+        if (resumeBtn) {
+            resumeBtn.addEventListener('click', function () {
+                var targetPage = bookState.page;
+                resumeBanner.hidden = true;
+                goToPage(targetPage);
+            });
+        }
+        if (resumeDismiss) {
+            resumeDismiss.addEventListener('click', function () {
+                resumeBanner.hidden = true;
+            });
+        }
+    }
+
+    /* Theme, bilingual, typography bindings */
+    document.querySelectorAll('[data-set-theme]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            prefs.theme = btn.getAttribute('data-set-theme') || 'light';
+            applyPrefs();
+        });
+    });
+    document.querySelectorAll('[data-set-bi]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            prefs.bilingual = btn.getAttribute('data-set-bi') || 'both';
+            applyPrefs();
+            if (searchInput && searchInput.value.trim()) runSearch(searchInput.value);
+        });
+    });
+    document.querySelectorAll('[data-set-leading]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            prefs.lineHeight = Number(btn.getAttribute('data-set-leading')) || 2.02;
+            applyPrefs();
+        });
+    });
+    document.querySelectorAll('[data-set-measure]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            prefs.measure = Number(btn.getAttribute('data-set-measure')) || 820;
+            applyPrefs();
+        });
+    });
+    document.querySelectorAll('[data-set-align]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            prefs.align = btn.getAttribute('data-set-align') || 'justify';
+            applyPrefs();
+        });
+    });
+    document.querySelectorAll('[data-set-orig-font]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            prefs.origFont = btn.getAttribute('data-set-orig-font') || 'sans';
+            applyPrefs();
+        });
+    });
+
+    var fontDown = document.getElementById('font-dec');
+    var fontUp = document.getElementById('font-inc');
+    var fontReset = document.getElementById('font-reset');
+    if (fontDown) fontDown.addEventListener('click', function () {
+        prefs.fontSize = Math.max(13, Math.round((prefs.fontSize - 1) * 10) / 10);
+        applyPrefs();
+    });
+    if (fontUp) fontUp.addEventListener('click', function () {
+        prefs.fontSize = Math.min(24, Math.round((prefs.fontSize + 1) * 10) / 10);
+        applyPrefs();
+    });
+    if (fontReset) fontReset.addEventListener('click', function () {
+        prefs.fontSize = 16.5;
+        prefs.lineHeight = 2.02;
+        prefs.measure = 820;
+        prefs.align = 'justify';
+        prefs.origFont = 'sans';
+        applyPrefs();
+    });
+
+    /* Settings popover */
+    var settingsBtn = document.getElementById('btn-settings');
+    var settingsPopover = document.getElementById('settings-popover');
+    function toggleSettings(force) {
+        if (!settingsPopover || !settingsBtn) return;
+        var next = typeof force === 'boolean' ? force : !settingsPopover.classList.contains('is-open');
+        settingsPopover.classList.toggle('is-open', next);
+        settingsBtn.setAttribute('aria-expanded', String(next));
+    }
+    if (settingsBtn) {
+        settingsBtn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            toggleSettings();
+        });
+    }
+
+    /* TOC Drawer & Bookmarks */
+    var drawer = document.getElementById('toc-drawer');
+    var backdrop = document.getElementById('drawer-backdrop');
+    var drawerBtn = document.getElementById('btn-toc');
+    var drawerClose = document.getElementById('btn-toc-close');
+    var tocFilter = document.getElementById('toc-filter');
+    var tabToc = document.getElementById('tab-toc');
+    var tabBookmarks = document.getElementById('tab-bookmarks');
+    var panelToc = document.getElementById('panel-toc');
+    var panelBookmarks = document.getElementById('panel-bookmarks');
+
+    function toggleDrawer(force) {
+        if (!drawer || !backdrop) return;
+        var next = typeof force === 'boolean' ? force : !drawer.classList.contains('is-open');
+        drawer.classList.toggle('is-open', next);
+        backdrop.classList.toggle('is-open', next);
+        if (drawerBtn) drawerBtn.setAttribute('aria-pressed', String(next));
+    }
+    if (drawerBtn) drawerBtn.addEventListener('click', function () { toggleDrawer(); });
+    if (drawerClose) drawerClose.addEventListener('click', function () { toggleDrawer(false); });
+    if (backdrop) backdrop.addEventListener('click', function () { toggleDrawer(false); });
+
+    if (tabToc && tabBookmarks && panelToc && panelBookmarks) {
+        tabToc.addEventListener('click', function () {
+            tabToc.setAttribute('aria-selected', 'true');
+            tabBookmarks.setAttribute('aria-selected', 'false');
+            panelToc.hidden = false;
+            panelBookmarks.hidden = true;
+        });
+        tabBookmarks.addEventListener('click', function () {
+            tabToc.setAttribute('aria-selected', 'false');
+            tabBookmarks.setAttribute('aria-selected', 'true');
+            panelToc.hidden = true;
+            panelBookmarks.hidden = false;
+            renderBookmarksList();
+        });
+    }
+
+    if (tocFilter) {
+        tocFilter.addEventListener('input', function () {
+            var q = tocFilter.value.trim().toLowerCase();
+            document.querySelectorAll('#drawer-toc-list li').forEach(function (li) {
+                var text = (li.textContent || '').toLowerCase();
+                li.style.display = !q || text.indexOf(q) !== -1 ? '' : 'none';
+            });
+        });
+    }
+
+    document.querySelectorAll('#drawer-toc-list a').forEach(function (a) {
+        a.addEventListener('click', function () {
+            if (window.innerWidth < 1100) toggleDrawer(false);
+        });
+    });
+
+    function syncBookmarkButtons() {
+        document.querySelectorAll('.js-bookmark-btn').forEach(function (btn) {
+            var p = Number(btn.getAttribute('data-page'));
+            var marked = bookState.bookmarks.indexOf(p) !== -1;
+            btn.setAttribute('aria-pressed', String(marked));
+            btn.textContent = marked ? 'نشان‌شده ★' : 'نشانک';
+        });
+    }
+
+    function renderBookmarksList() {
+        if (!panelBookmarks) return;
+        panelBookmarks.textContent = '';
+        if (!bookState.bookmarks.length) {
+            var empty = document.createElement('p');
+            empty.className = 'drawer-empty';
+            empty.textContent = 'هنوز صفحه‌ای نشانک نشده است. روی دکمهٔ «نشانک» در بالای هر صفحه بزنید.';
+            panelBookmarks.appendChild(empty);
+            return;
+        }
+        var ol = document.createElement('ol');
+        ol.className = 'drawer-list';
+        bookState.bookmarks
+            .slice()
+            .sort(function (a, b) { return a - b; })
+            .forEach(function (p) {
+                var section = pages[p - 1];
+                var label = section ? section.getAttribute('data-page-label') || ('صفحه ' + toFa(p)) : ('صفحه ' + toFa(p));
+                var li = document.createElement('li');
+                var link = document.createElement('a');
+                link.href = '#page-' + p;
+                var titleSpan = document.createElement('span');
+                titleSpan.textContent = label;
+                var pgSpan = document.createElement('span');
+                pgSpan.className = 'toc-pg';
+                pgSpan.textContent = 'ص ' + toFa(p);
+                link.appendChild(titleSpan);
+                link.appendChild(pgSpan);
+                link.addEventListener('click', function () {
+                    if (window.innerWidth < 1100) toggleDrawer(false);
+                });
+                li.appendChild(link);
+                ol.appendChild(li);
+            });
+        panelBookmarks.appendChild(ol);
+    }
+
+    document.querySelectorAll('.js-bookmark-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            var p = Number(btn.getAttribute('data-page'));
+            var idx = bookState.bookmarks.indexOf(p);
+            if (idx === -1) {
+                bookState.bookmarks.push(p);
+                showToast('صفحه به نشانک‌ها افزوده شد');
+            } else {
+                bookState.bookmarks.splice(idx, 1);
+                showToast('نشانک برداشته شد');
+            }
+            saveBookState();
+            syncBookmarkButtons();
+            if (panelBookmarks && !panelBookmarks.hidden) renderBookmarksList();
+        });
+    });
+
+    /* Copy citation */
+    function copyText(text, okMsg) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function () {
+                showToast(okMsg);
+            }).catch(function () {
+                fallbackCopy(text, okMsg);
+            });
+        } else {
+            fallbackCopy(text, okMsg);
+        }
+    }
+    function fallbackCopy(text, okMsg) {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); showToast(okMsg); } catch (_) {}
+        ta.remove();
+    }
+
+    document.querySelectorAll('.js-cite-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            var label = btn.getAttribute('data-label') || '';
+            var parts = ['«' + (meta.title || '') + '»'];
+            if (meta.author) parts.push(meta.author);
+            if (label) parts.push(label);
+            copyText(parts.join('، '), 'ارجاع صفحه رونوشت شد');
+        });
+    });
+
+    /* Code copy buttons */
+    document.querySelectorAll('.page pre').forEach(function (pre) {
+        var wrap = document.createElement('div');
+        wrap.className = 'pre-wrap';
+        pre.parentNode.insertBefore(wrap, pre);
+        wrap.appendChild(pre);
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'code-copy no-print';
+        btn.textContent = 'رونوشت';
+        btn.addEventListener('click', function () {
+            copyText(pre.textContent || '', 'کد رونوشت شد');
+        });
+        wrap.appendChild(btn);
+    });
+
+    /* Page navigation */
+    var prevPageBtn = document.getElementById('btn-prev-page');
+    var nextPageBtn = document.getElementById('btn-next-page');
+    if (prevPageBtn) prevPageBtn.addEventListener('click', function () { goToPage(currentPage - 1); });
+    if (nextPageBtn) nextPageBtn.addEventListener('click', function () { goToPage(currentPage + 1); });
+    if (pageInput) {
+        pageInput.addEventListener('change', function () {
+            var val = Number(normalizeDigits(pageInput.value));
+            if (!isNaN(val) && val >= 1) goToPage(val);
+        });
+        pageInput.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                var val = Number(normalizeDigits(pageInput.value));
+                if (!isNaN(val) && val >= 1) goToPage(val);
+                pageInput.blur();
+            }
+        });
+    }
+
+    /* Live search with TreeWalker */
+    var searchInput = document.getElementById('search-input');
+    var searchCount = document.getElementById('search-count');
+    var searchPrev = document.getElementById('search-prev');
+    var searchNext = document.getElementById('search-next');
+    var searchClear = document.getElementById('search-clear');
+    var hits = [];
+    var hitIndex = -1;
+
+    function clearSearch() {
+        document.querySelectorAll('mark.search-hit').forEach(function (mark) {
+            var parent = mark.parentNode;
+            if (!parent) return;
+            parent.replaceChild(document.createTextNode(mark.textContent || ''), mark);
+            parent.normalize();
+        });
+        hits = [];
+        hitIndex = -1;
+        updateSearchUi();
+    }
+
+    function updateSearchUi() {
+        if (searchCount) {
+            searchCount.textContent = hits.length ? toFa(hitIndex + 1) + ' از ' + toFa(hits.length) : '۰';
+        }
+        if (searchPrev) searchPrev.disabled = hits.length === 0;
+        if (searchNext) searchNext.disabled = hits.length === 0;
+        if (searchClear) searchClear.disabled = !(searchInput && searchInput.value);
+    }
+
+    function activateHit(idx) {
+        if (!hits.length) return;
+        hits.forEach(function (m) { m.classList.remove('is-active'); });
+        hitIndex = (idx + hits.length) % hits.length;
+        var el = hits[hitIndex];
+        el.classList.add('is-active');
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        updateSearchUi();
+    }
+
+    function isHiddenNode(node) {
+        var el = node.parentElement;
+        while (el && el !== document.body) {
+            if (el.classList.contains('no-print')) return true;
+            if (prefs.bilingual === 'translated' && el.classList.contains('bi-orig')) return true;
+            if (prefs.bilingual === 'original' && el.classList.contains('bi-trans')) return true;
+            var tag = el.tagName;
+            if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'MARK') return true;
+            el = el.parentElement;
+        }
+        return false;
+    }
+
+    function runSearch(query) {
+        clearSearch();
+        var q = String(query || '').trim();
+        if (!q || q.length < 2) {
+            updateSearchUi();
+            return;
+        }
+        var qLower = q.toLowerCase();
+        var textNodes = [];
+        pages.forEach(function (page) {
+            var walker = document.createTreeWalker(page, NodeFilter.SHOW_TEXT, {
+                acceptNode: function (node) {
+                    if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+                    return isHiddenNode(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+                }
+            });
+            var n;
+            while ((n = walker.nextNode())) textNodes.push(n);
+        });
+
+        textNodes.forEach(function (node) {
+            var text = node.nodeValue || '';
+            var lower = text.toLowerCase();
+            var idx = lower.indexOf(qLower);
+            if (idx === -1) return;
+            var frag = document.createDocumentFragment();
+            var pos = 0;
+            while (idx !== -1 && hits.length < 400) {
+                if (idx > pos) frag.appendChild(document.createTextNode(text.slice(pos, idx)));
+                var mark = document.createElement('mark');
+                mark.className = 'search-hit';
+                mark.textContent = text.slice(idx, idx + q.length);
+                frag.appendChild(mark);
+                hits.push(mark);
+                pos = idx + q.length;
+                idx = lower.indexOf(qLower, pos);
+            }
+            if (pos < text.length) frag.appendChild(document.createTextNode(text.slice(pos)));
+            if (node.parentNode) node.parentNode.replaceChild(frag, node);
+        });
+
+        if (hits.length) activateHit(0);
+        else updateSearchUi();
+    }
+
+    var searchTimer = null;
+    if (searchInput) {
+        searchInput.addEventListener('input', function () {
+            if (searchTimer) clearTimeout(searchTimer);
+            searchTimer = setTimeout(function () { runSearch(searchInput.value); }, 180);
+        });
+        searchInput.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                if (!hits.length) runSearch(searchInput.value);
+                else activateHit(e.shiftKey ? hitIndex - 1 : hitIndex + 1);
+            } else if (e.key === 'Escape') {
+                searchInput.value = '';
+                clearSearch();
+                searchInput.blur();
+            }
+        });
+    }
+    if (searchNext) searchNext.addEventListener('click', function () { activateHit(hitIndex + 1); });
+    if (searchPrev) searchPrev.addEventListener('click', function () { activateHit(hitIndex - 1); });
+    if (searchClear) searchClear.addEventListener('click', function () {
+        if (searchInput) searchInput.value = '';
+        clearSearch();
+    });
+
+    /* Footnote popover */
+    var fnPopover = document.getElementById('fn-popover');
+    var fnTitle = document.getElementById('fn-popover-title');
+    var fnBody = document.getElementById('fn-popover-body');
+    var fnJump = document.getElementById('fn-popover-jump');
+    var fnClose = document.getElementById('fn-popover-close');
+
+    function closeFootnote() {
+        if (fnPopover) fnPopover.classList.remove('is-open');
+    }
+
+    document.querySelectorAll('sup.fn-ref a').forEach(function (link) {
+        link.addEventListener('click', function (e) {
+            var href = link.getAttribute('href') || '';
+            if (!href.startsWith('#') || !fnPopover || !fnBody || !fnTitle || !fnJump) return;
+            var target = document.getElementById(href.slice(1));
+            if (!target) return;
+            e.preventDefault();
+            e.stopPropagation();
+
+            fnTitle.textContent = 'پاورقی ' + (link.textContent || '');
+            fnBody.textContent = '';
+            var contentSpan = target.querySelector('span:nth-child(2)');
+            if (contentSpan) fnBody.appendChild(contentSpan.cloneNode(true));
+            fnJump.setAttribute('href', href);
+
+            fnPopover.classList.add('is-open');
+            var rect = link.getBoundingClientRect();
+            var popW = fnPopover.offsetWidth || 320;
+            var popH = fnPopover.offsetHeight || 140;
+            var left = Math.min(window.innerWidth - popW - 12, Math.max(12, rect.left + rect.width / 2 - popW / 2));
+            var top = rect.bottom + 8 + popH > window.innerHeight ? Math.max(12, rect.top - popH - 8) : rect.bottom + 8;
+            fnPopover.style.left = left + 'px';
+            fnPopover.style.top = top + 'px';
+        });
+    });
+
+    if (fnClose) fnClose.addEventListener('click', closeFootnote);
+    if (fnJump) fnJump.addEventListener('click', function () {
+        var href = fnJump.getAttribute('href') || '';
+        closeFootnote();
+        if (href.startsWith('#')) {
+            var li = document.getElementById(href.slice(1));
+            if (li) {
+                li.classList.add('is-flash');
+                setTimeout(function () { li.classList.remove('is-flash'); }, 1500);
+            }
+        }
+    });
+
+    document.querySelectorAll('.fn-back').forEach(function (back) {
+        back.addEventListener('click', function () {
+            var href = back.getAttribute('href') || '';
+            if (href.startsWith('#')) {
+                var sup = document.getElementById(href.slice(1));
+                if (sup) {
+                    sup.classList.add('is-flash');
+                    setTimeout(function () { sup.classList.remove('is-flash'); }, 1500);
+                }
+            }
+        });
+    });
+
+    /* Image lightbox */
+    var lightbox = document.getElementById('lightbox');
+    var lightboxImg = document.getElementById('lightbox-img');
+    var lightboxClose = document.getElementById('lightbox-close');
+    function closeLightbox() {
+        if (lightbox) lightbox.classList.remove('is-open');
+    }
+    document.querySelectorAll('.page img').forEach(function (img) {
+        img.addEventListener('click', function () {
+            if (!lightbox || !lightboxImg) return;
+            lightboxImg.src = img.currentSrc || img.src;
+            lightboxImg.alt = img.alt || '';
+            lightbox.classList.add('is-open');
+        });
+    });
+    if (lightboxClose) lightboxClose.addEventListener('click', closeLightbox);
+    if (lightbox) lightbox.addEventListener('click', function (e) {
+        if (e.target === lightbox) closeLightbox();
+    });
+
+    /* Focus mode & print & scroll progress */
+    var focusBtn = document.getElementById('btn-focus');
+    var focusExit = document.getElementById('btn-focus-exit');
+    var printBtn = document.getElementById('btn-print');
+    var topBtn = document.getElementById('btn-top');
+    var progressFill = document.getElementById('progress-fill');
+
+    function toggleFocus(force) {
+        var next = typeof force === 'boolean' ? force : root.getAttribute('data-focus') !== 'true';
+        root.setAttribute('data-focus', String(next));
+        if (focusBtn) focusBtn.setAttribute('aria-pressed', String(next));
+        if (next) toggleDrawer(false);
+    }
+    if (focusBtn) focusBtn.addEventListener('click', function () { toggleFocus(); });
+    if (focusExit) focusExit.addEventListener('click', function () { toggleFocus(false); });
+    if (printBtn) printBtn.addEventListener('click', function () { window.print(); });
+    if (topBtn) topBtn.addEventListener('click', function () { window.scrollTo({ top: 0, behavior: 'smooth' }); });
+
+    var headings = Array.prototype.slice.call(document.querySelectorAll('.page h1[id], .page h2[id], .page h3[id]'));
+    var tocLinks = new Map();
+    document.querySelectorAll('#drawer-toc-list a[href^="#"]').forEach(function (a) {
+        tocLinks.set(a.getAttribute('href').slice(1), a);
+    });
+
+    function onScroll() {
+        var docH = document.documentElement.scrollHeight - window.innerHeight;
+        var ratio = docH > 0 ? Math.min(1, Math.max(0, window.scrollY / docH)) : 0;
+        if (progressFill) progressFill.style.width = (ratio * 100).toFixed(1) + '%';
+        if (topBtn) topBtn.classList.toggle('is-visible', window.scrollY > 420);
+
+        var activePage = 1;
+        var mid = window.innerHeight * 0.28;
+        for (var i = 0; i < pages.length; i += 1) {
+            var rect = pages[i].getBoundingClientRect();
+            if (rect.top <= mid) activePage = i + 1;
+            else break;
+        }
+        if (activePage !== currentPage) setCurrentPage(activePage);
+
+        var activeHeadingId = '';
+        for (var j = 0; j < headings.length; j += 1) {
+            if (headings[j].getBoundingClientRect().top <= 120) activeHeadingId = headings[j].id;
+            else break;
+        }
+        tocLinks.forEach(function (link, id) {
+            link.classList.toggle('is-current', id === activeHeadingId);
+        });
+    }
+    var scrollRaf = 0;
+    window.addEventListener('scroll', function () {
+        if (scrollRaf) return;
+        scrollRaf = window.requestAnimationFrame(function () {
+            scrollRaf = 0;
+            onScroll();
+        });
+    }, { passive: true });
+
+    document.addEventListener('click', function (e) {
+        if (settingsPopover && settingsPopover.classList.contains('is-open')) {
+            if (!settingsPopover.contains(e.target) && e.target !== settingsBtn) toggleSettings(false);
+        }
+        if (fnPopover && fnPopover.classList.contains('is-open')) {
+            if (!fnPopover.contains(e.target)) closeFootnote();
+        }
+    });
+
+    document.addEventListener('keydown', function (e) {
+        var tag = e.target && e.target.tagName;
+        var typing = tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable);
+        if (e.key === 'Escape') {
+            toggleSettings(false);
+            closeFootnote();
+            closeLightbox();
+            toggleDrawer(false);
+            if (root.getAttribute('data-focus') === 'true') toggleFocus(false);
+            return;
+        }
+        if (typing) return;
+        if (e.key === '/' && searchInput) {
+            e.preventDefault();
+            if (root.getAttribute('data-focus') === 'true') toggleFocus(false);
+            searchInput.focus();
+            searchInput.select();
+        } else if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey) {
+            e.preventDefault();
+            toggleFocus();
+        } else if ((e.key === 't' || e.key === 'T') && !e.ctrlKey && !e.metaKey) {
+            e.preventDefault();
+            toggleDrawer();
+        } else if (e.key === ']') {
+            e.preventDefault();
+            goToPage(currentPage + 1);
+        } else if (e.key === '[') {
+            e.preventDefault();
+            goToPage(currentPage - 1);
+        }
+    });
+
+    applyPrefs();
+    syncBookmarkButtons();
+    updateSearchUi();
+    onScroll();
+})();`;
 
 async function renderHtmlDocument(
     doc: DocumentModel,
@@ -605,9 +2298,12 @@ async function renderHtmlDocument(
         pageIndex: number,
         notes: StandardNote[]
     ): string => {
+        const pageNumber = pageIndex + 1;
+        const pageLabel = page.marker || `صفحه ${toPersianDigits(pageNumber)}`;
+
         const prepared = (notes.length ? notes : page.footnotes).map((note, index) => {
             const label = String(note.label || index + 1);
-            let anchor = `fn-${pageIndex + 1}-${safeId(label)}`;
+            let anchor = `fn-${pageNumber}-${safeId(label)}`;
             while (usedAnchors.has(anchor)) anchor = `${anchor}-x`;
             usedAnchors.add(anchor);
             return { label, text: note.text, anchor };
@@ -637,14 +2333,22 @@ async function renderHtmlDocument(
 
         let html = sanitizeHtml(renderMarkdown(markdown));
         html = highlightMarks(html);
-        html = addHeadingIds(html, toc);
+        html = transformCallouts(html);
+        html = wrapTables(html);
+        html = addHeadingIds(html, toc, pageNumber, pageLabel);
 
-        const marker = page.marker
-            ? `<div class="page-marker">${escapeHtml(page.marker)}</div>`
-            : '';
-        return `<section class="page" id="page-${pageIndex + 1}">${marker}${html}${notesHtml(
-            prepared
-        )}</section>`;
+        const pageHead =
+            `<div class="page__head">` +
+            `<span class="page__marker">${escapeHtml(pageLabel)}</span>` +
+            `<span class="page__actions no-print">` +
+            `<button type="button" class="page-act js-bookmark-btn" data-page="${pageNumber}" aria-pressed="false">نشانک</button>` +
+            `<button type="button" class="page-act js-cite-btn" data-label="${escapeHtml(pageLabel)}">ارجاع</button>` +
+            `</span>` +
+            `</div>`;
+
+        return `<section class="page" id="page-${pageNumber}" data-page-index="${pageNumber}" data-page-label="${escapeHtml(
+            pageLabel
+        )}">${pageHead}${html}${notesHtml(prepared)}</section>`;
     };
 
     const pageParts: string[] = [];
@@ -658,23 +2362,165 @@ async function renderHtmlDocument(
         ? `<nav class="toc"><h2>فهرست مطالب</h2><ol>${toc
               .map(
                   (entry) =>
-                      `<li class="is-level-${entry.level}"><a href="#${entry.id}">${escapeHtml(
-                          entry.text
-                      )}</a></li>`
+                      `<li class="is-level-${entry.level}"><a href="#${entry.id}">` +
+                      `<span>${entry.html}</span>` +
+                      `<span class="toc__pg">${escapeHtml(toPersianDigits(entry.pageNumber))}</span>` +
+                      `</a></li>`
               )
               .join('')}</ol></nav>`
         : '';
 
-    const banner = `<div class="banner no-print"><strong>آمادهٔ ذخیره به PDF</strong>در پنجرهٔ چاپ، مقصد را «Save as PDF / ذخیره به PDF» انتخاب کنید. اگر پنجره باز نشد، Ctrl+P بزنید.</div>`;
+    const drawerTocHtml = toc.length
+        ? `<ol class="drawer-list" id="drawer-toc-list">${toc
+              .map(
+                  (entry) =>
+                      `<li class="is-level-${entry.level}"><a href="#${entry.id}">` +
+                      `<span>${entry.html}</span>` +
+                      `<span class="toc-pg">${escapeHtml(toPersianDigits(entry.pageNumber))}</span>` +
+                      `</a></li>`
+              )
+              .join('')}</ol>`
+        : `<p class="drawer-empty">سرفصلی در متن یافت نشد.</p>`;
+
+    const bilingualSwitch = doc.hasBilingual
+        ? `<div class="segmented" role="group" aria-label="حالت نمایش زبان">` +
+          `<button type="button" data-set-bi="both" aria-pressed="true">دوزبانه</button>` +
+          `<button type="button" data-set-bi="translated" aria-pressed="false">ترجمه</button>` +
+          `<button type="button" data-set-bi="original" aria-pressed="false">اصلی</button>` +
+          `</div>`
+        : '';
+
+    const origFontSetting = doc.hasBilingual
+        ? `<div class="settings-row"><div class="settings-label"><span>قلم متن اصلی</span></div>` +
+          `<div class="settings-grid">` +
+          `<button type="button" data-set-orig-font="sans" aria-pressed="true">وزیرمتن</button>` +
+          `<button type="button" data-set-orig-font="traditional" aria-pressed="false">نسخ سنتی</button>` +
+          `</div></div>`
+        : '';
+
+    const readerBar =
+        `<div class="progress-track no-print" aria-hidden="true"><div class="progress-fill" id="progress-fill"></div></div>` +
+        `<header class="reader-bar no-print">` +
+        `<div class="reader-bar__inner">` +
+        `<div class="reader-bar__start">` +
+        `<button type="button" class="bar-btn" id="btn-toc" aria-pressed="false" title="فهرست مطالب و نشانک‌ها (T)">فهرست</button>` +
+        `<p class="bar-title" title="${escapeHtml(doc.title)}">${escapeHtml(doc.title)}</p>` +
+        `</div>` +
+        `<div class="reader-bar__center">` +
+        `<div class="search-box">` +
+        `<input type="search" id="search-input" class="bar-input" placeholder="جستجو در متن... (/)" aria-label="جستجو در متن">` +
+        `<span class="search-count" id="search-count">۰</span>` +
+        `<button type="button" class="search-nav" id="search-prev" title="نتیجهٔ قبلی" aria-label="نتیجهٔ قبلی" disabled>▲</button>` +
+        `<button type="button" class="search-nav" id="search-next" title="نتیجهٔ بعدی" aria-label="نتیجهٔ بعدی" disabled>▼</button>` +
+        `<button type="button" class="search-nav" id="search-clear" title="پاک کردن جستجو" aria-label="پاک کردن جستجو" disabled>✕</button>` +
+        `</div>` +
+        `<div class="page-jump">` +
+        `<button type="button" class="search-nav" id="btn-prev-page" title="صفحهٔ قبل ([)" aria-label="صفحهٔ قبل">›</button>` +
+        `<span>صفحه</span>` +
+        `<input type="text" inputmode="numeric" id="page-jump-input" class="page-jump__input" value="1" aria-label="شماره صفحه">` +
+        `<span>از ${escapeHtml(toPersianDigits(doc.pages.length))}</span>` +
+        `<button type="button" class="search-nav" id="btn-next-page" title="صفحهٔ بعد (])" aria-label="صفحهٔ بعد">‹</button>` +
+        `</div>` +
+        `</div>` +
+        `<div class="reader-bar__end">` +
+        bilingualSwitch +
+        `<div class="segmented" role="group" aria-label="تم مطالعه">` +
+        `<button type="button" data-set-theme="light" aria-pressed="true">روشن</button>` +
+        `<button type="button" data-set-theme="sepia" aria-pressed="false">سپیا</button>` +
+        `<button type="button" data-set-theme="dark" aria-pressed="false">تاریک</button>` +
+        `</div>` +
+        `<div class="settings-wrap">` +
+        `<button type="button" class="bar-btn" id="btn-settings" aria-expanded="false" aria-controls="settings-popover">قلم و صفحه</button>` +
+        `<div class="settings-popover" id="settings-popover" role="dialog" aria-label="تنظیمات خواندن">` +
+        `<div class="settings-row"><div class="settings-label"><span>اندازهٔ قلم</span><span id="font-size-val">۱۷px</span></div>` +
+        `<div class="settings-grid">` +
+        `<button type="button" id="font-dec">کوچک‌تر</button>` +
+        `<button type="button" id="font-inc">بزرگ‌تر</button>` +
+        `<button type="button" id="font-reset">بازنشانی</button>` +
+        `</div></div>` +
+        `<div class="settings-row"><div class="settings-label"><span>فاصلهٔ خطوط</span></div>` +
+        `<div class="settings-grid">` +
+        `<button type="button" data-set-leading="1.75" aria-pressed="false">فشرده</button>` +
+        `<button type="button" data-set-leading="2.02" aria-pressed="true">متعادل</button>` +
+        `<button type="button" data-set-leading="2.3" aria-pressed="false">باز</button>` +
+        `</div></div>` +
+        `<div class="settings-row"><div class="settings-label"><span>عرض صفحه</span></div>` +
+        `<div class="settings-grid">` +
+        `<button type="button" data-set-measure="680" aria-pressed="false">باریک</button>` +
+        `<button type="button" data-set-measure="820" aria-pressed="true">میانه</button>` +
+        `<button type="button" data-set-measure="1020" aria-pressed="false">عریض</button>` +
+        `</div></div>` +
+        `<div class="settings-row"><div class="settings-label"><span>تراز متن</span></div>` +
+        `<div class="settings-grid">` +
+        `<button type="button" data-set-align="justify" aria-pressed="true">دوطرفه</button>` +
+        `<button type="button" data-set-align="start" aria-pressed="false">راست‌چین</button>` +
+        `</div></div>` +
+        origFontSetting +
+        `</div>` +
+        `</div>` +
+        `<button type="button" class="bar-btn" id="btn-focus" aria-pressed="false" title="حالت تمرکز (F)">تمرکز</button>` +
+        `<button type="button" class="bar-btn" id="btn-print" title="چاپ یا ذخیرهٔ PDF">چاپ / PDF</button>` +
+        `</div>` +
+        `</div>` +
+        `</header>` +
+        `<div class="drawer-backdrop no-print" id="drawer-backdrop"></div>` +
+        `<aside class="toc-drawer no-print" id="toc-drawer" aria-label="فهرست و نشانک‌ها">` +
+        `<div class="toc-drawer__head">` +
+        `<div class="toc-drawer__tabs" role="tablist">` +
+        `<button type="button" id="tab-toc" role="tab" aria-selected="true">فهرست مطالب</button>` +
+        `<button type="button" id="tab-bookmarks" role="tab" aria-selected="false">نشانک‌ها</button>` +
+        `</div>` +
+        `<button type="button" class="bar-btn bar-btn--icon" id="btn-toc-close" aria-label="بستن">✕</button>` +
+        `</div>` +
+        `<div class="toc-drawer__search"><input type="search" id="toc-filter" class="toc-filter" placeholder="فیلتر سرفصل‌ها..."></div>` +
+        `<div class="toc-drawer__body">` +
+        `<div id="panel-toc" role="tabpanel">${drawerTocHtml}</div>` +
+        `<div id="panel-bookmarks" role="tabpanel" hidden></div>` +
+        `</div>` +
+        `</aside>` +
+        `<div class="resume-banner no-print" id="resume-banner" hidden>` +
+        `<span>آخرین مطالعهٔ شما در صفحهٔ <strong id="resume-page-label"></strong> بوده است.</span>` +
+        `<div class="resume-banner__actions">` +
+        `<button type="button" class="bar-btn is-active" id="resume-go">ادامهٔ مطالعه</button>` +
+        `<button type="button" class="bar-btn" id="resume-dismiss">بستن</button>` +
+        `</div>` +
+        `</div>` +
+        `<button type="button" class="bar-btn focus-exit no-print" id="btn-focus-exit">خروج از تمرکز (Esc)</button>` +
+        `<button type="button" class="bar-btn fab-top no-print" id="btn-top" aria-label="بازگشت به بالا">↑ بالا</button>` +
+        `<div class="fn-popover no-print" id="fn-popover" role="dialog" aria-label="پاورقی">` +
+        `<div class="fn-popover__head"><span id="fn-popover-title">پاورقی</span><button type="button" class="search-nav" id="fn-popover-close" aria-label="بستن">✕</button></div>` +
+        `<div class="fn-popover__body" id="fn-popover-body"></div>` +
+        `<div class="fn-popover__foot"><a href="#" class="bar-btn" id="fn-popover-jump">رفتن به پاورقی صفحه</a></div>` +
+        `</div>` +
+        `<div class="lightbox no-print" id="lightbox" role="dialog" aria-label="نمایش تصویر">` +
+        `<button type="button" class="bar-btn lightbox__close" id="lightbox-close">بستن (Esc)</button>` +
+        `<img id="lightbox-img" src="" alt="">` +
+        `</div>` +
+        `<div class="toast-msg no-print" id="toast-msg" role="status" aria-live="polite"></div>`;
+
+    const metaPayload: HtmlMetaPayload = {
+        bookKey: doc.filename || doc.title,
+        title: doc.title,
+        author: doc.author,
+        totalPages: doc.pages.length,
+        hasBilingual: doc.hasBilingual
+    };
+    const safeMetaJson = JSON.stringify(metaPayload).replace(/</g, '\\u003c');
+
+    const banner = options.autoPrint
+        ? `<div class="banner no-print"><strong>آمادهٔ ذخیره به PDF</strong>در پنجرهٔ چاپ، مقصد را «Save as PDF / ذخیره به PDF» انتخاب کنید. اگر پنجره باز نشد، Ctrl+P بزنید.</div>`
+        : '';
     const printScript = options.autoPrint
         ? `<script>window.addEventListener('load',function(){setTimeout(function(){window.print();},700);});</script>`
         : '';
 
     return (
-        `<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">` +
+        `<!doctype html><html lang="fa" dir="rtl" data-theme="light" data-bilingual="both" data-align="justify" data-orig-font="sans"><head><meta charset="utf-8">` +
         `<meta name="viewport" content="width=device-width, initial-scale=1">` +
         `<title>${escapeHtml(doc.title)}</title><style>${fonts}\n${HTML_STYLES}</style></head>` +
-        `<body>${banner}${coverHtml(doc)}${tocHtml}${pageParts.join('')}${printScript}</body></html>`
+        `<body>${banner}${readerBar}${coverHtml(doc)}${tocHtml}${pageParts.join('')}` +
+        `<script id="book-meta" type="application/json">${safeMetaJson}</script>` +
+        `<script>${HTML_READER_SCRIPT}</script>${printScript}</body></html>`
     );
 }
 

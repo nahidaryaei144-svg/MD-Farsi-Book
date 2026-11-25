@@ -31,6 +31,7 @@ export interface TranslateConfig {
     glossary: string;
     concurrency: number;
     order: TranslateOrder;
+    bilingual: boolean;
 }
 
 export interface TranslateConfigPublic {
@@ -44,6 +45,7 @@ export interface TranslateConfigPublic {
     glossary: string;
     concurrency: number;
     order: TranslateOrder;
+    bilingual: boolean;
 }
 
 export interface TranslateEngineInfo {
@@ -105,7 +107,8 @@ export const DEFAULT_TRANSLATE_CONFIG: TranslateConfig = {
     fmRules: DEFAULT_FRONTMATTER_RULES,
     glossary: DEFAULT_GLOSSARY,
     concurrency: 8,
-    order: 'page'
+    order: 'page',
+    bilingual: false
 };
 
 export const ENGINE_CATALOG: TranslateEngineInfo[] = [
@@ -214,7 +217,8 @@ export function normalizeTranslateConfig(input: unknown, base: TranslateConfig):
         fmRules: text(source.fmRules, base.fmRules),
         glossary: text(source.glossary, base.glossary),
         concurrency: positiveInt(source.concurrency, base.concurrency),
-        order: isOrder(source.order) ? source.order : base.order
+        order: isOrder(source.order) ? source.order : base.order,
+        bilingual: typeof source.bilingual === 'boolean' ? source.bilingual : base.bilingual
     };
 }
 
@@ -251,7 +255,8 @@ export function publicTranslateConfig(config: TranslateConfig): TranslateConfigP
         fmRules: config.fmRules,
         glossary: config.glossary,
         concurrency: config.concurrency,
-        order: config.order
+        order: config.order,
+        bilingual: config.bilingual
     };
 }
 

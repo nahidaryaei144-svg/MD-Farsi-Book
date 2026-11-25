@@ -59,6 +59,7 @@ function faDuration(seconds: number | null): string {
 
 export function TranslateDialog({ open, book, notify, onClose, onTranslated }: TranslateDialogProps) {
     const [target, setTarget] = useState('fa');
+    const [bilingual, setBilingual] = useState(false);
     const [force, setForce] = useState(false);
     const [markTranslator, setMarkTranslator] = useState(true);
     const [estimate, setEstimate] = useState<TranslationEstimate | null>(null);
@@ -90,6 +91,7 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                 if (cancelled) return;
                 setConfig(payload.config);
                 setEngines(payload.engines);
+                setBilingual(Boolean(payload.config.bilingual));
             } catch {
                 /* the dialog still works with the saved defaults */
             }
@@ -112,6 +114,7 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                 if (current.filename === book.filename) {
                     setJob(current);
                     setTarget(current.target);
+                    setBilingual(Boolean(current.bilingual));
                 } else if (isActive) {
                     setJob(current);
                 }
@@ -186,7 +189,8 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
             const payload = await api.translateStart(book.filename, target, {
                 force,
                 markTranslator,
-                mode
+                mode,
+                bilingual
             });
             setJob(payload.job);
             handledRef.current = '';
@@ -289,6 +293,7 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                             <span className="translate__badge">
                                 {ownJob.mode === 'review' ? 'بازبینی و ترمیم' : 'ترجمهٔ کامل'}
                             </span>
+                            {ownJob.bilingual ? <span className="translate__badge">دوزبانه</span> : null}
                             <span className="translate__badge">{ownJob.engineLabel}</span>
                             <span className="translate__badge">
                                 {ownJob.engine === 'gemini'
@@ -414,6 +419,12 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                             <span className="translate__engine-hint">تغییر از تنظیمات ← ترجمه و مترجم</span>
                         </div>
 
+                        <Toggle
+                            checked={bilingual}
+                            onChange={setBilingual}
+                            label="ترجمهٔ دوزبانه (حفظ متن اصلی همراه با ترجمه)"
+                            hint="هر بند، عنوان، جدول و پاورقی به‌صورت دو‌زبانه ذخیره می‌شود؛ ظاهر و رنگ هر دو زبان از تنظیمات قابل تغییر است."
+                        />
                         <Toggle
                             checked={force}
                             onChange={setForce}

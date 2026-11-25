@@ -3,7 +3,7 @@ import { api } from '../../lib/api';
 import { cn, faNumber } from '../../lib/format';
 import { buildHighlightPattern, normalizeTerm } from '../../lib/search';
 import { parseBookPages } from '../../lib/markdown';
-import type { BookMetadata, BookSummary, ExportFormat } from '../../types';
+import type { BilingualDisplayMode, BookMetadata, BookSummary, ExportFormat } from '../../types';
 import { Icon } from '../icons';
 import { Button, IconButton } from '../ui/Controls';
 import { Modal } from '../ui/Modal';
@@ -13,6 +13,8 @@ interface ReaderProps {
     content: string;
     initialQuery?: string;
     initialTarget?: { pageIndex: number; matchIndex: number; text?: string; context?: string };
+    bilingualDisplay?: BilingualDisplayMode;
+    onBilingualDisplay?: (mode: BilingualDisplayMode) => void;
     onClose: () => void;
     onSaveMeta: (book: BookSummary, metadata: BookMetadata) => Promise<void>;
     onSaveContent: (content: string) => Promise<void>;
@@ -128,11 +130,19 @@ const EXPORT_FORMATS: { format: ExportFormat; label: string; hint: string }[] = 
     { format: 'pdf', label: 'PDF', hint: 'خروجی PDF' }
 ];
 
+const READER_BILINGUAL_MODES: { value: BilingualDisplayMode; label: string; hint: string }[] = [
+    { value: 'both', label: 'دوزبانه', hint: 'نمایش هم‌زمان متن اصلی و ترجمه' },
+    { value: 'translated', label: 'ترجمه', hint: 'نمایش فقط متن ترجمه‌شده' },
+    { value: 'original', label: 'اصلی', hint: 'نمایش فقط متن زبان اصلی' }
+];
+
 export function Reader({
     book,
     content,
     initialQuery,
     initialTarget,
+    bilingualDisplay = 'both',
+    onBilingualDisplay,
     onClose,
     onSaveMeta,
     onSaveContent,
@@ -141,6 +151,7 @@ export function Reader({
     notify
 }: ReaderProps) {
     const pages = useMemo(() => parseBookPages(content), [content]);
+    const hasBilingual = useMemo(() => content.includes('bi-orig'), [content]);
     const title = book.frontmatter['نام کتاب'] || book.filename;
     const meta = book.frontmatter;
     const read = meta['خوانده شده'] === true;
@@ -196,16 +207,30 @@ export function Reader({
         const items: TocItem[] = headings.map((heading, index) => {
             const id = `reader-sec-${index}`;
             heading.id = id;
+            const orig = heading.querySelector('.bi-orig')?.textContent?.trim() || '';
+            const trans = heading.querySelector('.bi-trans')?.textContent?.trim() || '';
+            let text = '';
+            if (orig || trans) {
+                if (bilingualDisplay === 'translated') text = trans || orig;
+                else if (bilingualDisplay === 'original') text = orig || trans;
+                else text = [orig, trans].filter(Boolean).join(' — ');
+            } else {
+                text = (heading.textContent || '').trim();
+            }
             return {
                 id,
                 level: Number(heading.tagName[1]) || 2,
-                text: (heading.textContent || '').trim() || `بخش ${index + 1}`
+                text: text || `بخش ${index + 1}`
             };
         });
         setToc(items);
         setCollapsed(collapseDeeperLevels(buildTocTree(items)));
         setActiveSection(-1);
+    }, [pages, bilingualDisplay]);
 
+    useLayoutEffect(() => {
+        const container = contentRef.current;
+        if (!container) return;
         const frame = requestAnimationFrame(() => {
             const saved = Number(localStorage.getItem(positionKey) || 0);
             if (container && saved > 0) container.scrollTop = saved;
@@ -609,7 +634,7 @@ export function Reader({
                         : 'خروجی گرفتن انجام نشد.'
                 );
             }
-            if (type.includes('text/html')) {
+            if (format === 'pdf' && type.includes('text/html')) {
                 window.open(api.exportUrl(book.filename, format), '_blank', 'noopener');
                 notify('پنجرهٔ چاپ باز شد؛ برای ذخیرهٔ PDF گزینهٔ «Save as PDF» را انتخاب کنید.', 'info');
                 return;
@@ -689,6 +714,29 @@ export function Reader({
                             </button>
                         ))}
                     </div>
+
+                    {hasBilingual && onBilingualDisplay ? (
+                        <>
+                            <span className="reader__divider" />
+                            <div className="reader__group reader__bilingual" role="group" aria-label="حالت نمایش دوزبانه">
+                                {READER_BILINGUAL_MODES.map((item) => (
+                                    <button
+                                        key={item.value}
+                                        type="button"
+                                        className={cn(
+                                            'reader__bilingual-btn',
+                                            bilingualDisplay === item.value && 'is-active'
+                                        )}
+                                        title={item.hint}
+                                        aria-pressed={bilingualDisplay === item.value}
+                                        onClick={() => onBilingualDisplay(item.value)}
+                                    >
+                                        {item.label}
+                                    </button>
+                                ))}
+                            </div>
+                        </>
+                    ) : null}
 
                     <span className="reader__divider" />
 

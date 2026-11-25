@@ -131,13 +131,21 @@ function footnoteKey(value: string): string {
     return encodeURIComponent(value).replace(/%/g, '_');
 }
 
+function formatFootnoteHtml(text: string): string {
+    const escaped = escapeHtml(text);
+    return escaped
+        .replace(/&lt;span class=&quot;(bi-orig|bi-trans)&quot;&gt;/g, '<span class="$1">')
+        .replace(/&lt;\/span&gt;/g, '</span>')
+        .replace(/&lt;br\s*\/?&gt;/gi, '<br>');
+}
+
 function renderFootnotes(pageIndex: number, footnotes: BookFootnote[]): string {
     if (!footnotes.length) return '';
     const items = footnotes
         .map((footnote) => {
             const noteId = footnote.id == null ? String(footnote.num) : footnoteKey(footnote.id);
             const label = footnote.label == null ? String(footnote.num) : footnote.label;
-            return `<li class="book-footnote" id="fn-p${pageIndex}-${noteId}"><span class="book-footnote-num">${escapeHtml(label)}</span><div class="book-footnote-text">${escapeHtml(footnote.text)}</div><a class="book-footnote-back" href="#ref-p${pageIndex}-${noteId}" title="بازگشت به متن">↩</a></li>`;
+            return `<li class="book-footnote" id="fn-p${pageIndex}-${noteId}"><span class="book-footnote-num">${escapeHtml(label)}</span><div class="book-footnote-text">${formatFootnoteHtml(footnote.text)}</div><a class="book-footnote-back" href="#ref-p${pageIndex}-${noteId}" title="بازگشت به متن">↩</a></li>`;
         })
         .join('');
     return `<div class="book-footnotes"><div class="book-footnotes-title">پاورقی‌ها</div><ol class="book-footnotes-list">${items}</ol></div>`;

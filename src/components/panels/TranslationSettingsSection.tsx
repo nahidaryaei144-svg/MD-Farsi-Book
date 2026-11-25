@@ -3,7 +3,7 @@ import { api } from '../../lib/api';
 import { faNumber } from '../../lib/format';
 import type { TranslateEngineId, TranslateEngineInfo } from '../../types';
 import { Icon } from '../icons';
-import { Button, Field, TextInput } from '../ui/Controls';
+import { Button, Field, TextInput, Toggle } from '../ui/Controls';
 
 interface TranslationSettingsSectionProps {
     notify: (message: string, tone?: 'success' | 'error' | 'info') => void;
@@ -51,6 +51,7 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
     const [savedEngine, setSavedEngine] = useState<TranslateEngineId>('google');
     const [concurrency, setConcurrency] = useState(8);
     const [order, setOrder] = useState<'page' | 'structured'>('page');
+    const [bilingual, setBilingual] = useState(false);
     const [texts, setTexts] = useState({
         prompt: '',
         rules: '',
@@ -79,6 +80,7 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
                 setSavedKey(payload.config.hasApiKey);
                 setConcurrency(payload.config.concurrency);
                 setOrder(payload.config.order);
+                setBilingual(Boolean(payload.config.bilingual));
                 setTexts({
                     prompt: payload.config.prompt,
                     rules: payload.config.rules,
@@ -126,6 +128,7 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
             glossary: texts.glossary,
             concurrency,
             order,
+            bilingual,
             ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
             ...(engineId !== savedEngine && !apiKey.trim() ? { clearApiKey: true } : {})
         });
@@ -298,6 +301,13 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
                             </option>
                         </select>
                     </Field>
+
+                    <Toggle
+                        checked={bilingual}
+                        onChange={setBilingual}
+                        label="ترجمهٔ دوزبانه (پیش‌فرض)"
+                        hint="با فعال‌بودن، متن زبان اصلی کنار ترجمه حفظ می‌شود و در کتاب‌خوان می‌توانید رنگ و ظاهر هر دو را جداگانه تنظیم کنید."
+                    />
 
                     <div className="translate__row">
                         <Field

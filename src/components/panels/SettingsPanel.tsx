@@ -1,9 +1,10 @@
 import { useState } from 'react';
 import { cn, faBytes, faNumber } from '../../lib/format';
-import { FONT_OPTIONS, THEME_OPTIONS } from '../../hooks/useSettings';
-import type { ThemeName } from '../../types';
+import { BILINGUAL_DISPLAY_OPTIONS, FONT_OPTIONS, THEME_OPTIONS } from '../../hooks/useSettings';
+import type { BilingualSettings, ThemeName } from '../../types';
 import { Icon, type IconName } from '../icons';
 import { Button, Field, TextInput } from '../ui/Controls';
+import { BilingualStyleSection } from './BilingualStyleSection';
 import { DataFolderSection } from './DataFolderSection';
 import { TranslationSettingsSection } from './TranslationSettingsSection';
 
@@ -12,6 +13,7 @@ interface SettingsPanelProps {
     font: string;
     zoom: number;
     cornerRadius: number;
+    bilingual: BilingualSettings;
     libraryDir: string;
     folders: string[];
     bookCount: number;
@@ -20,6 +22,8 @@ interface SettingsPanelProps {
     onFont: (font: string) => void;
     onZoom: (zoom: number) => void;
     onCornerRadius: (value: number) => void;
+    onBilingual: (value: BilingualSettings) => void;
+    onResetBilingual: () => void;
     onAddBook: () => void;
     onCreateFolder: (parent: string, name: string) => Promise<unknown>;
     notify: (message: string, tone?: 'success' | 'error' | 'info') => void;
@@ -49,6 +53,7 @@ export function SettingsPanel({
     font,
     zoom,
     cornerRadius,
+    bilingual,
     libraryDir,
     folders,
     bookCount,
@@ -57,6 +62,8 @@ export function SettingsPanel({
     onFont,
     onZoom,
     onCornerRadius,
+    onBilingual,
+    onResetBilingual,
     onAddBook,
     onCreateFolder,
     notify
@@ -212,6 +219,35 @@ export function SettingsPanel({
                         />
                         <div className="radius-preview">پیش‌نمایش گوشه‌های پنل</div>
                     </div>
+
+                    <div className="settings-block">
+                        <div className="settings-block__row">
+                            <span className="settings-block__label">نمایش کتاب‌های دوزبانه</span>
+                            <button
+                                type="button"
+                                className="settings-inline-link"
+                                onClick={() => setTab('translation')}
+                            >
+                                تنظیم رنگ و ظاهر ←
+                            </button>
+                        </div>
+                        <div className="bilingual-segmented">
+                            {BILINGUAL_DISPLAY_OPTIONS.map((option) => (
+                                <button
+                                    key={option.value}
+                                    type="button"
+                                    className={cn(
+                                        'bilingual-segmented__btn',
+                                        bilingual.display === option.value && 'is-active'
+                                    )}
+                                    onClick={() => onBilingual({ ...bilingual, display: option.value })}
+                                    aria-pressed={bilingual.display === option.value}
+                                >
+                                    {option.label}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
                 </section>
             </div>
 
@@ -284,6 +320,11 @@ export function SettingsPanel({
             </div>
 
             <div className="settings-group" role="tabpanel" aria-label="ترجمه و مترجم" hidden={tab !== 'translation'}>
+                <BilingualStyleSection
+                    value={bilingual}
+                    onChange={onBilingual}
+                    onReset={onResetBilingual}
+                />
                 <TranslationSettingsSection notify={notify} />
             </div>
 

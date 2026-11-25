@@ -156,6 +156,7 @@ export interface TranslationJob {
     samples: TranslationSample[];
     speed: number;
     etaSeconds: number | null;
+    bilingual?: boolean;
 }
 
 export interface TranslationEstimate {
@@ -197,6 +198,7 @@ export interface TranslateConfigPublic {
     glossary: string;
     concurrency: number;
     order: 'page' | 'structured';
+    bilingual: boolean;
 }
 
 export interface TranslateConfigPayload {
@@ -373,4 +375,24 @@ export interface BatchReplaceResult {
     }[];
     failed: string[];
     snapshot: string | null;
+}
+
+export type BilingualDisplayMode = 'both' | 'translated' | 'original';
+export type BilingualBoxStyle = 'none' | 'subtle' | 'border' | 'card';
+export type BilingualFontWeight = '400' | '500' | '700';
+
+export interface BilingualSideStyle {
+    color: string;
+    fontSize: number;
+    weight: BilingualFontWeight;
+    opacity: number;
+    font: string;
+    italic: boolean;
+    box: BilingualBoxStyle;
+}
+
+export interface BilingualSettings {
+    display: BilingualDisplayMode;
+    original: BilingualSideStyle;
+    translated: BilingualSideStyle;
 }

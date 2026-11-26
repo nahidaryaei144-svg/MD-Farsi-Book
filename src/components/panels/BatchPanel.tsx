@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api } from '../../lib/api';
 import { faNumber } from '../../lib/format';
 import type {
@@ -6,7 +6,9 @@ import type {
     BatchMetadataResult,
     BatchReplaceOptions,
     BatchReplaceResult,
-    BookSummary
+    BookSummary,
+    QueuedBookJob,
+    TranslationJob
 } from '../../types';
 import { Icon } from '../icons';
 import { Button, Field, TagInput, TextInput } from '../ui/Controls';
@@ -51,6 +53,28 @@ export function BatchPanel({ books, selection, onSelectionChange, notify, onAppl
     const [replaceBusy, setReplaceBusy] = useState(false);
     const [replacePreview, setReplacePreview] = useState<BatchReplaceResult | null>(null);
     const [confirmReplace, setConfirmReplace] = useState(false);
+
+    const [queueTarget, setQueueTarget] = useState('fa');
+    const [queueBilingual, setQueueBilingual] = useState(false);
+    const [queueAutoGlossary, setQueueAutoGlossary] = useState(false);
+    const [queueBusy, setQueueBusy] = useState(false);
+    const [queueItems, setQueueItems] = useState<QueuedBookJob[]>([]);
+    const [activeTranslation, setActiveTranslation] = useState<TranslationJob | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        void api
+            .translateStatus()
+            .then((res) => {
+                if (cancelled) return;
+                setActiveTranslation(res.job);
+                if (Array.isArray(res.queue)) setQueueItems(res.queue);
+            })
+            .catch(() => {});
+        return () => {
+            cancelled = true;
+        };
+    }, []);
 
     const visibleBooks = useMemo(() => {
         const needle = bookQuery.trim().toLocaleLowerCase('fa');
@@ -175,6 +199,36 @@ export function BatchPanel({ books, selection, onSelectionChange, notify, onAppl
             notify(message, 'error');
         } finally {
             setReplaceBusy(false);
+        }
+    };
+
+    const enqueueSelectedBooks = async () => {
+        if (!selection.size) {
+            notify('ابتدا کتاب‌های موردنظر را انتخاب کنید.', 'info');
+            return;
+        }
+        setQueueBusy(true);
+        try {
+            const payload = await api.translateQueueAdd(
+                [...selection].map((filename) => ({
+                    filename,
+                    target: queueTarget,
+                    mode: 'translate',
+                    bilingual: queueBilingual,
+                    autoGlossary: queueAutoGlossary
+                }))
+            );
+            setQueueItems(payload.queue);
+            notify(
+                payload.startedImmediately
+                    ? `${faNumber(selection.size)} کتاب به صف ترجمه اضافه شد و ترجمهٔ نخستین کتاب آغاز گردید.`
+                    : `${faNumber(selection.size)} کتاب به صف ترجمه اضافه شد.`,
+                'success'
+            );
+        } catch (err) {
+            notify(err instanceof Error ? err.message : 'افزودن به صف ترجمه انجام نشد.', 'error');
+        } finally {
+            setQueueBusy(false);
         }
     };
 
@@ -429,6 +483,97 @@ export function BatchPanel({ books, selection, onSelectionChange, notify, onAppl
                             <Icon name="info" size={14} /> تغییرات گروهی بدون ساخت نسخهٔ پشتیبان خودکار اعمال می‌شود؛
                             پیش از اعمال، پیش‌نمایش را ببینید.
                         </p>
+                    </section>
+
+                    <section className="batch-block">
+                        <h3>
+                            <Icon name="globe" size={16} /> صف ترجمهٔ گروهی کتاب‌ها
+                        </h3>
+                        <div className="batch-options">
+                            <select
+                                className="input select"
+                                value={queueTarget}
+                                onChange={(event) => setQueueTarget(event.target.value)}
+                                aria-label="زبان مقصد ترجمهٔ گروهی"
+                            >
+                                <option value="fa">فارسی</option>
+                                <option value="en">انگلیسی</option>
+                                <option value="ar">عربی</option>
+                                <option value="ur">اردو</option>
+                                <option value="tr">ترکی</option>
+                            </select>
+                            <label>
+                                <input
+                                    type="checkbox"
+                                    checked={queueBilingual}
+                                    onChange={(event) => setQueueBilingual(event.target.checked)}
+                                />
+                                <span>حالت دوزبانه</span>
+                            </label>
+                            <label>
+                                <input
+                                    type="checkbox"
+                                    checked={queueAutoGlossary}
+                                    onChange={(event) => setQueueAutoGlossary(event.target.checked)}
+                                />
+                                <span>استخراج خودکار واژه‌نامه</span>
+                            </label>
+                        </div>
+                        <div className="batch-footer">
+                            <Button
+                                variant="primary"
+                                size="sm"
+                                icon="globe"
+                                disabled={queueBusy || !selection.size}
+                                onClick={() => void enqueueSelectedBooks()}
+                            >
+                                {queueBusy
+                                    ? 'در حال افزودن به صف…'
+                                    : `افزودن ${faNumber(selection.size)} کتاب به صف ترجمه`}
+                            </Button>
+                            {queueItems.length ? (
+                                <Button
+                                    variant="soft"
+                                    size="sm"
+                                    icon="close"
+                                    onClick={() => void api.translateQueueClear().then((r) => setQueueItems(r.queue))}
+                                >
+                                    پاک‌کردن صف
+                                </Button>
+                            ) : null}
+                        </div>
+                        {activeTranslation && (activeTranslation.status === 'running' || activeTranslation.status === 'paused') ? (
+                            <p className="batch-result">
+                                <Icon name="bolt" size={14} /> اکنون در حال ترجمه: {activeTranslation.title} (
+                                {faNumber(activeTranslation.done)} از {faNumber(activeTranslation.total)})
+                            </p>
+                        ) : null}
+                        {queueItems.length ? (
+                            <div className="batch-preview">
+                                {queueItems.map((item) => (
+                                    <div key={item.id} className="batch-preview__item">
+                                        <strong>
+                                            <span>{item.title}</span>
+                                            <button
+                                                type="button"
+                                                className="settings-inline-link"
+                                                onClick={() =>
+                                                    void api
+                                                        .translateQueueRemove(item.id)
+                                                        .then((r) => setQueueItems(r.queue))
+                                                }
+                                            >
+                                                حذف از صف
+                                            </button>
+                                        </strong>
+                                        <small>
+                                            مقصد: {item.targetLabel}
+                                            {item.bilingual ? ' · دوزبانه' : ''}
+                                        </small>
+                                    </div>
+                                ))}
+                            </div>
+                        ) : null}
                     </section>
                 </div>
             </div>

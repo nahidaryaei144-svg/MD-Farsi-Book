@@ -122,9 +122,18 @@ export type TranslationStatus = 'idle' | 'running' | 'paused' | 'done' | 'cancel
 export type TranslationMode = 'translate' | 'review';
 export type ExportFormat = 'md' | 'docx' | 'html' | 'pdf';
 
+export type GeminiPlan = 'free' | 'paid';
+
 export interface TranslationSample {
     source: string;
     translated: string;
+}
+
+export interface TranslationUsage {
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    requests: number;
 }
 
 export interface TranslationJob {
@@ -157,6 +166,8 @@ export interface TranslationJob {
     speed: number;
     etaSeconds: number | null;
     bilingual?: boolean;
+    pageRange?: string;
+    usage?: TranslationUsage;
 }
 
 export interface TranslationEstimate {
@@ -175,7 +186,60 @@ export interface TranslationEstimate {
     characters: number;
 }
 
+export interface TranslationPreviewItem {
+    source: string;
+    translated: string;
+    qaOk: boolean;
+    qaIssue?: string;
+}
+
+export interface TranslationPreviewResult {
+    filename: string;
+    title: string;
+    page: number;
+    totalPages: number;
+    target: string;
+    targetLabel: string;
+    engine: string;
+    engineLabel: string;
+    items: TranslationPreviewItem[];
+    usage: TranslationUsage;
+}
+
+export interface GlossaryDiscoveryResult {
+    terms: string[];
+    mergedCount: number;
+    glossary: string;
+    usage: TranslationUsage;
+}
+
+export interface QueuedBookJob {
+    id: string;
+    filename: string;
+    title: string;
+    target: string;
+    targetLabel: string;
+    mode: TranslationMode;
+    bilingual?: boolean;
+    force?: boolean;
+    markTranslator?: boolean;
+    pageRange?: string;
+    autoGlossary?: boolean;
+    addedAt: string;
+}
+
 export type TranslateEngineId = 'google' | 'libretranslate' | 'deepl' | 'gemini' | 'openai' | 'anthropic';
+export type TranslationPresetId = 'islamic-ar-fa' | 'literary-general' | 'technical-academic' | 'custom';
+
+export interface TranslationPreset {
+    id: TranslationPresetId;
+    label: string;
+    description: string;
+    prompt: string;
+    rules: string;
+    fmRules: string;
+    glossary: string;
+}
 
 export interface TranslateEngineInfo {
     id: TranslateEngineId;
@@ -192,6 +256,8 @@ export interface TranslateConfigPublic {
     endpoint: string;
     model: string;
     hasApiKey: boolean;
+    geminiPlan?: GeminiPlan;
+    preset?: TranslationPresetId;
     prompt: string;
     rules: string;
     fmRules: string;
@@ -204,6 +270,7 @@ export interface TranslateConfigPublic {
 export interface TranslateConfigPayload {
     config: TranslateConfigPublic;
     engines: TranslateEngineInfo[];
+    presets?: TranslationPreset[];
 }
 
 export interface Snapshot {

@@ -185,6 +185,16 @@ export function Reader({
     const [editorOpen, setEditorOpen] = useState(false);
     const [draft, setDraft] = useState('');
     const [savingContent, setSavingContent] = useState(false);
+    const [biEditMode, setBiEditMode] = useState(false);
+    const [biModal, setBiModal] = useState<{
+        start: number;
+        end: number;
+        origRaw: string;
+        origText: string;
+        transDraft: string;
+    } | null>(null);
+    const [biRetranslating, setBiRetranslating] = useState(false);
+    const [biSaving, setBiSaving] = useState(false);
 
     useEffect(() => {
         const previousTitle = document.title;
@@ -314,6 +324,12 @@ export function Reader({
                     const parent = (node as Text).parentElement;
                     if (!parent) return NodeFilter.FILTER_REJECT;
                     if (parent.closest('mark.reader-hit') || parent.closest('script')) return NodeFilter.FILTER_REJECT;
+                    if (bilingualDisplay === 'translated' && parent.closest('.bi-orig')) {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    if (bilingualDisplay === 'original' && parent.closest('.bi-trans')) {
+                        return NodeFilter.FILTER_REJECT;
+                    }
                     return NodeFilter.FILTER_ACCEPT;
                 }
             });
@@ -361,7 +377,7 @@ export function Reader({
                 goToMark(0, marks);
             }
         },
-        [clearSearchMarks, goToMark, initialTarget]
+        [clearSearchMarks, goToMark, initialTarget, bilingualDisplay]
     );
 
     useEffect(() => {
@@ -573,8 +589,105 @@ export function Reader({
         }
     };
 
+    const findBilingualMatches = useCallback((source: string) => {
+        const list: { innerStart: number; innerEnd: number; inner: string; origInner: string }[] = [];
+        const spanRe = /<span\b[^>]*\bclass=["'][^"']*\bbi-(orig|trans)\b[^"']*["'][^>]*>/gi;
+        const closeTag = '</span>';
+        let lastOrigInner = '';
+        let match: RegExpExecArray | null;
+
+        while ((match = spanRe.exec(source))) {
+            const kind = match[1].toLowerCase();
+            const openEnd = match.index + match[0].length;
+            let cursor = openEnd;
+            let depth = 1;
+            while (cursor < source.length && depth > 0) {
+                const nextOpen = source.indexOf('<span', cursor);
+                const nextClose = source.indexOf(closeTag, cursor);
+                if (nextClose < 0) break;
+                if (nextOpen >= 0 && nextOpen < nextClose) {
+                    depth += 1;
+                    cursor = nextOpen + 5;
+                } else {
+                    depth -= 1;
+                    cursor = nextClose + closeTag.length;
+                }
+            }
+            if (depth !== 0) continue;
+            const innerStart = openEnd;
+            const innerEnd = cursor - closeTag.length;
+            const inner = source.slice(innerStart, innerEnd);
+            if (kind === 'orig') {
+                lastOrigInner = inner;
+            } else {
+                list.push({ innerStart, innerEnd, inner, origInner: lastOrigInner });
+                lastOrigInner = '';
+            }
+            spanRe.lastIndex = cursor;
+        }
+        return list;
+    }, []);
+
+    const normalizeLoose = (text: string) =>
+        text
+            .replace(/<[^>]+>/g, '')
+            .replace(/[*_`~]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+    const openBilingualEditorForElement = (transEl: HTMLElement) => {
+        const container = contentRef.current;
+        if (!container) return;
+        const allDom = Array.from(container.querySelectorAll<HTMLElement>('.book-page .bi-trans'));
+        const domIndex = allDom.indexOf(transEl);
+        const clickedText = normalizeLoose(transEl.textContent || '');
+        const occurrences = findBilingualMatches(content);
+        if (!occurrences.length) return;
+
+        let chosen = domIndex >= 0 && domIndex < occurrences.length ? occurrences[domIndex] : null;
+        if (chosen && normalizeLoose(chosen.inner) !== clickedText) {
+            chosen = null;
+        }
+        if (!chosen) {
+            let bestDist = Infinity;
+            occurrences.forEach((occ, idx) => {
+                if (normalizeLoose(occ.inner) === clickedText) {
+                    const dist = domIndex >= 0 ? Math.abs(idx - domIndex) : idx;
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        chosen = occ;
+                    }
+                }
+            });
+        }
+        if (!chosen) {
+            notify('مکان دقیق این بند در متن کتاب پیدا نشد.', 'info');
+            return;
+        }
+        const origText = normalizeLoose(chosen.origInner) ||
+            (transEl.previousElementSibling?.classList.contains('bi-orig')
+                ? transEl.previousElementSibling.textContent || ''
+                : '');
+        setBiModal({
+            start: chosen.innerStart,
+            end: chosen.innerEnd,
+            origRaw: chosen.origInner,
+            origText,
+            transDraft: chosen.inner
+        });
+    };
+
     const handleContentClick = (event: React.MouseEvent) => {
-        const link = (event.target as HTMLElement).closest('a[href^="#"]') as HTMLAnchorElement | null;
+        const targetEl = event.target as HTMLElement;
+        if (biEditMode || event.altKey) {
+            const biTrans = targetEl.closest('.bi-trans') as HTMLElement | null;
+            if (biTrans) {
+                event.preventDefault();
+                openBilingualEditorForElement(biTrans);
+                return;
+            }
+        }
+        const link = targetEl.closest('a[href^="#"]') as HTMLAnchorElement | null;
         if (!link) return;
         const href = link.getAttribute('href') || '';
         if (!href.startsWith('#')) return;
@@ -590,6 +703,45 @@ export function Reader({
         });
         target.classList.add('flash');
         setTimeout(() => target.classList.remove('flash'), 2200);
+    };
+
+    const runBiRetranslate = async () => {
+        if (!biModal || biRetranslating) return;
+        const sourceForEngine = (biModal.origRaw || biModal.origText).trim();
+        if (!sourceForEngine) return;
+        setBiRetranslating(true);
+        try {
+            const res = await api.translateSegment(sourceForEngine, 'fa');
+            if (res.translated) {
+                setBiModal((cur) => (cur ? { ...cur, transDraft: res.translated } : cur));
+            }
+        } catch (err) {
+            notify(err instanceof Error ? err.message : 'بازترجمهٔ بند انجام نشد.', 'error');
+        } finally {
+            setBiRetranslating(false);
+        }
+    };
+
+    const saveBiSegment = async () => {
+        if (!biModal || biSaving) return;
+        const nextText = biModal.transDraft.trim();
+        if (!nextText) return;
+        setBiSaving(true);
+        try {
+            const updatedContent =
+                content.slice(0, biModal.start) + nextText + content.slice(biModal.end);
+            await onSaveContent(updatedContent);
+            const src = (biModal.origRaw || biModal.origText).trim();
+            if (src) {
+                void api.translateTmUpdate(src, nextText, 'fa').catch(() => {});
+            }
+            notify('بند ترجمه‌شده در کتاب و حافظهٔ ترجمه ذخیره شد.', 'success');
+            setBiModal(null);
+        } catch (err) {
+            notify(err instanceof Error ? err.message : 'ذخیرهٔ بند انجام نشد.', 'error');
+        } finally {
+            setBiSaving(false);
+        }
     };
 
     useEffect(() => {
@@ -623,8 +775,10 @@ export function Reader({
     const exportBook = async (format: ExportFormat) => {
         if (exporting) return;
         setExporting(true);
+        const activeDisplay: BilingualDisplayMode = hasBilingual ? bilingualDisplay : 'both';
+        const url = api.exportUrl(book.filename, format, activeDisplay);
         try {
-            const response = await fetch(api.exportUrl(book.filename, format), { cache: 'no-store' });
+            const response = await fetch(url, { cache: 'no-store' });
             const type = response.headers.get('content-type') || '';
             if (!response.ok) {
                 const payload = await response.json().catch(() => null);
@@ -635,7 +789,7 @@ export function Reader({
                 );
             }
             if (format === 'pdf' && type.includes('text/html')) {
-                window.open(api.exportUrl(book.filename, format), '_blank', 'noopener');
+                window.open(url, '_blank', 'noopener');
                 notify('پنجرهٔ چاپ باز شد؛ برای ذخیرهٔ PDF گزینهٔ «Save as PDF» را انتخاب کنید.', 'info');
                 return;
             }
@@ -644,12 +798,24 @@ export function Reader({
             const objectUrl = URL.createObjectURL(blob);
             const link = document.createElement('a');
             link.href = objectUrl;
-            link.download = `${(book.frontmatter['نام کتاب'] || 'book').replace(/[\\/:*?"<>|]+/g, '-')}.${format}`;
+            const modeSuffix =
+                activeDisplay === 'translated'
+                    ? ' - ترجمه'
+                    : activeDisplay === 'original'
+                      ? ' - اصلی'
+                      : '';
+            link.download = `${(book.frontmatter['نام کتاب'] || 'book').replace(/[\\/:*?"<>|]+/g, '-')}${modeSuffix}.${format}`;
             document.body.appendChild(link);
             link.click();
             link.remove();
             setTimeout(() => URL.revokeObjectURL(objectUrl), 5000);
-            notify(`خروجی ${format.toUpperCase()} ذخیره شد.`, 'success');
+            const modeNote =
+                activeDisplay === 'translated'
+                    ? ' (فقط ترجمه)'
+                    : activeDisplay === 'original'
+                      ? ' (فقط زبان اصلی)'
+                      : '';
+            notify(`خروجی ${format.toUpperCase()}${modeNote} ذخیره شد.`, 'success');
         } catch (error) {
             notify(error instanceof Error ? error.message : 'خروجی گرفتن انجام نشد.', 'error');
         } finally {
@@ -659,7 +825,12 @@ export function Reader({
 
     return (
         <div
-            className={cn('reader', focusMode && 'is-focus', fullscreen && 'is-fullscreen')}
+            className={cn(
+                'reader',
+                focusMode && 'is-focus',
+                fullscreen && 'is-fullscreen',
+                biEditMode && 'is-bi-editing'
+            )}
             ref={overlayRef}
             role="document"
             aria-label={`مطالعهٔ ${title}`}
@@ -701,18 +872,28 @@ export function Reader({
                     <span className="reader__divider" />
 
                     <div className="reader__group reader__export" role="group" aria-label="خروجی گرفتن از کتاب">
-                        {EXPORT_FORMATS.map((item) => (
-                            <button
-                                key={item.format}
-                                type="button"
-                                className="reader__export-btn"
-                                title={item.hint}
-                                disabled={exporting}
-                                onClick={() => void exportBook(item.format)}
-                            >
-                                {item.label}
-                            </button>
-                        ))}
+                        {EXPORT_FORMATS.map((item) => {
+                            const modeLabel =
+                                hasBilingual && bilingualDisplay === 'translated'
+                                    ? ' (فقط ترجمه)'
+                                    : hasBilingual && bilingualDisplay === 'original'
+                                      ? ' (فقط اصلی)'
+                                      : hasBilingual
+                                        ? ' (دوزبانه)'
+                                        : '';
+                            return (
+                                <button
+                                    key={item.format}
+                                    type="button"
+                                    className="reader__export-btn"
+                                    title={`${item.hint}${modeLabel}`}
+                                    disabled={exporting}
+                                    onClick={() => void exportBook(item.format)}
+                                >
+                                    {item.label}
+                                </button>
+                            );
+                        })}
                     </div>
 
                     {hasBilingual && onBilingualDisplay ? (
@@ -735,6 +916,21 @@ export function Reader({
                                     </button>
                                 ))}
                             </div>
+                            <IconButton
+                                icon="sparkles"
+                                label={
+                                    biEditMode
+                                        ? 'خروج از حالت ویرایش بندهای ترجمه'
+                                        : 'ویرایش سریع بندهای ترجمه (یا Alt+Click روی بند)'
+                                }
+                                active={biEditMode}
+                                onClick={() => {
+                                    setBiEditMode((v) => !v);
+                                    if (!biEditMode) {
+                                        notify('حالت ویرایش دوزبانه فعال شد؛ روی هر بند ترجمه کلیک کنید.', 'info');
+                                    }
+                                }}
+                            />
                         </>
                     ) : null}
 
@@ -950,6 +1146,63 @@ export function Reader({
                         <span>متادیتا در ابتدای فایل بین دو خط --- نوشته می‌شود.</span>
                     </div>
                 </div>
+            </Modal>
+
+            <Modal
+                open={Boolean(biModal)}
+                title="ویرایش و بازترجمهٔ بند"
+                kicker="اصلاح مستقیم در کتاب + آموزش حافظهٔ ترجمه"
+                icon="sparkles"
+                size="md"
+                onClose={() => !biSaving && setBiModal(null)}
+                footer={
+                    <>
+                        <Button
+                            variant="soft"
+                            size="sm"
+                            icon="refresh"
+                            disabled={biRetranslating || biSaving}
+                            onClick={() => void runBiRetranslate()}
+                        >
+                            {biRetranslating ? 'در حال بازترجمه…' : 'بازترجمه با موتور فعال'}
+                        </Button>
+                        <Button variant="soft" size="sm" disabled={biSaving} onClick={() => setBiModal(null)}>
+                            انصراف
+                        </Button>
+                        <Button
+                            variant="primary"
+                            size="sm"
+                            icon="save"
+                            disabled={biSaving || biRetranslating}
+                            onClick={() => void saveBiSegment()}
+                        >
+                            {biSaving ? 'در حال ذخیره…' : 'ذخیره در کتاب و حافظه'}
+                        </Button>
+                    </>
+                }
+            >
+                {biModal ? (
+                    <div className="bi-segment-editor">
+                        {biModal.origText ? (
+                            <div className="bi-segment-editor__orig">
+                                <span>متن مبدأ</span>
+                                <p dir="auto">{biModal.origText}</p>
+                            </div>
+                        ) : null}
+                        <label className="bi-segment-editor__label">
+                            <span>ترجمه (Markdown)</span>
+                            <textarea
+                                className="input textarea"
+                                rows={5}
+                                dir="auto"
+                                value={biModal.transDraft}
+                                onChange={(event) =>
+                                    setBiModal((cur) => (cur ? { ...cur, transDraft: event.target.value } : cur))
+                                }
+                            />
+                        </label>
+                    </div>
+                ) : null}
             </Modal>
         </div>
     );

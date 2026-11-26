@@ -3,14 +3,18 @@ import type {
     BatchMetadataResult,
     BatchReplaceOptions,
     BatchReplaceResult,
+    BilingualDisplayMode,
     BookContentPayload,
     BookMetadata,
     DataLocationInfo,
     ExportFormat,
+    GeminiPlan,
+    GlossaryDiscoveryResult,
     LibraryPayload,
     LibraryReport,
     PanelId,
     PanelLayout,
+    QueuedBookJob,
     RelocateResult,
     SearchOptions,
     SearchStreamEvent,
@@ -20,7 +24,10 @@ import type {
     TranslateEngineId,
     TranslationEstimate,
     TranslationJob,
-    TranslationMode
+    TranslationMode,
+    TranslationPresetId,
+    TranslationPreviewResult,
+    TranslationUsage
 } from '../types';
 
 async function request<T>(
@@ -200,6 +207,8 @@ export const api = {
         model: string;
         apiKey?: string;
         clearApiKey?: boolean;
+        geminiPlan?: GeminiPlan;
+        preset?: TranslationPresetId;
         prompt: string;
         rules: string;
         fmRules: string;
@@ -214,13 +223,72 @@ export const api = {
         filename: string,
         target: string,
         force: boolean,
-        mode: TranslationMode = 'translate'
-    ) => post<TranslationEstimate>('/api/translate/estimate', { filename, target, force, mode }),
+        mode: TranslationMode = 'translate',
+        pageRange?: string
+    ) =>
+        post<TranslationEstimate>('/api/translate/estimate', {
+            filename,
+            target,
+            force,
+            mode,
+            ...(pageRange ? { pageRange } : {})
+        }),
+
+    translatePreview: (filename: string, target: string, page = 1) =>
+        post<TranslationPreviewResult>('/api/translate/preview', { filename, target, page }),
+
+    translateDiscoverGlossary: (filename: string, target: string, saveToConfig = false) =>
+        post<GlossaryDiscoveryResult>('/api/translate/discover-glossary', {
+            filename,
+            target,
+            saveToConfig
+        }),
+
+    translateSegment: (text: string, target = 'fa') =>
+        post<{ translated: string; qaOk: boolean; qaIssue?: string; usage: TranslationUsage }>(
+            '/api/translate/segment',
+            { text, target }
+        ),
+
+    translateTmUpdate: (source: string, translated: string, target = 'fa') =>
+        post<{ saved: boolean }>('/api/translate/tm-update', { source, translated, target }),
+
+    translateQueueList: () => request<{ queue: QueuedBookJob[] }>('/api/translate/queue'),
+
+    translateQueueAdd: (
+        items: Array<{
+            filename: string;
+            target?: string;
+            mode?: TranslationMode;
+            bilingual?: boolean;
+            force?: boolean;
+            markTranslator?: boolean;
+            pageRange?: string;
+            autoGlossary?: boolean;
+        }>
+    ) =>
+        post<{ success: boolean; queue: QueuedBookJob[]; startedImmediately: boolean }>(
+            '/api/translate/queue',
+            { items }
+        ),
+
+    translateQueueRemove: (id: string) =>
+        post<{ success: boolean; queue: QueuedBookJob[] }>('/api/translate/queue/remove', { id }),
+
+    translateQueueClear: () =>
+        post<{ success: boolean; queue: QueuedBookJob[] }>('/api/translate/queue/clear', {}),
 
     translateStart: (
         filename: string,
         target: string,
-        options: { force: boolean; markTranslator: boolean; mode: TranslationMode; bilingual?: boolean }
+        options: {
+            force: boolean;
+            markTranslator: boolean;
+            mode: TranslationMode;
+            bilingual?: boolean;
+            pageRange?: string;
+            autoGlossary?: boolean;
+        }
     ) =>
         post<{ success: boolean; job: TranslationJob }>('/api/translate/start', {
             filename,
@@ -238,7 +306,8 @@ export const api = {
             sample: string;
         }>('/api/translate/test', {}),
 
-    translateStatus: () => request<{ job: TranslationJob | null }>('/api/translate/status'),
+    translateStatus: () =>
+        request<{ job: TranslationJob | null; queue?: QueuedBookJob[] }>('/api/translate/status'),
 
     translatePause: () => post<{ success: boolean; job: TranslationJob | null }>('/api/translate/pause', {}),
 
@@ -246,8 +315,10 @@ export const api = {
 
     translateCancel: () => post<{ success: boolean; job: TranslationJob | null }>('/api/translate/cancel', {}),
 
-    exportUrl: (filename: string, format: ExportFormat) =>
-        `/api/export?format=${format}&filename=${encodeURIComponent(filename)}`,
+    exportUrl: (filename: string, format: ExportFormat, display?: BilingualDisplayMode) =>
+        `/api/export?format=${format}&filename=${encodeURIComponent(filename)}${
+            display && display !== 'both' ? `&display=${encodeURIComponent(display)}` : ''
+        }`,
 
     location: () => request<DataLocationInfo>('/api/location'),
 

@@ -24,7 +24,7 @@ import { distinctTokens, stripFrontmatterOffset, tokenizeFolded } from './text-f
 
 const MANIFEST_FILE = path.join(STORAGE_DIR, 'search-index.json');
 const BITS_FILE = path.join(STORAGE_DIR, 'search-index.bin');
-const INDEX_VERSION = 2;
+const INDEX_VERSION = 3;
 const BUILD_CONCURRENCY = 2;
 const MAX_BITS_PER_BOOK = 96 * 1024;
 const MIN_BITS_PER_BOOK = 1024;

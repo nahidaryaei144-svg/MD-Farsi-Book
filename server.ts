@@ -65,11 +65,20 @@ import {
 } from './server/location.js';
 import {
     cancelTranslation,
+    clearTranslationQueue,
+    discoverBookGlossary,
+    enqueueTranslations,
     estimateTranslation,
     getTranslationJob,
+    getTranslationQueue,
     pauseTranslation,
+    previewTranslationPage,
+    removeQueuedTranslation,
     resumeTranslation,
+    retranslateSegment,
+    saveMemoryEntry,
     startTranslation,
+    subscribeTranslationEvents,
     testTranslationProvider
 } from './server/translate.js';
 import {
@@ -424,7 +433,16 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
         if (!allowed.includes(requested as ExportFormat)) {
             throw new HttpError('قالب خروجی پشتیبانی نمی‌شود.');
         }
-        const result = await buildExport(url.searchParams.get('filename'), requested as ExportFormat);
+        const rawDisplay = String(
+            url.searchParams.get('display') || url.searchParams.get('mode') || 'both'
+        ).toLowerCase();
+        const display =
+            rawDisplay === 'translated' || rawDisplay === 'original' ? rawDisplay : 'both';
+        const result = await buildExport(
+            url.searchParams.get('filename'),
+            requested as ExportFormat,
+            display
+        );
         const headers: Record<string, string | number> = {
             'Content-Type': result.contentType,
             'Cache-Control': 'no-store'
@@ -622,7 +640,38 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     }
 
     if (route === '/api/translate/status' && req.method === 'GET') {
-        sendJson(res, 200, { job: getTranslationJob() });
+        sendJson(res, 200, { job: getTranslationJob(), queue: getTranslationQueue() });
+        return true;
+    }
+
+    if (route === '/api/translate/events' && req.method === 'GET') {
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache, no-transform',
+            Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no'
+        });
+        const writeEvent = (payload: unknown) => {
+            if (res.writableEnded || res.destroyed) return;
+            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        };
+        writeEvent({ job: getTranslationJob(), queue: getTranslationQueue() });
+        const unsubscribe = subscribeTranslationEvents((payload) => {
+            writeEvent(payload);
+        });
+        const heartbeat = setInterval(() => {
+            if (!res.writableEnded && !res.destroyed) {
+                res.write(': ping\n\n');
+            }
+        }, 25_000);
+        heartbeat.unref?.();
+        const cleanup = () => {
+            clearInterval(heartbeat);
+            unsubscribe();
+            if (!res.writableEnded) res.end();
+        };
+        req.on('close', cleanup);
+        req.on('error', cleanup);
         return true;
     }
 
@@ -650,6 +699,72 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     if (route === '/api/translate/estimate' && req.method === 'POST') {
         const data = await readJsonBody<Record<string, unknown>>(req, 64 * 1024);
         sendJson(res, 200, await estimateTranslation(data.filename, data));
+        return true;
+    }
+
+    if (route === '/api/translate/preview' && req.method === 'POST') {
+        const data = await readJsonBody<Record<string, unknown>>(req, 64 * 1024);
+        sendJson(res, 200, await previewTranslationPage(data.filename, data));
+        return true;
+    }
+
+    if (route === '/api/translate/discover-glossary' && req.method === 'POST') {
+        const data = await readJsonBody<Record<string, unknown>>(req, 64 * 1024);
+        const result = await discoverBookGlossary(data.filename, data);
+        if (data.saveToConfig === true && result.mergedCount > 0) {
+            await updateTranslateConfig({ glossary: result.glossary });
+        }
+        sendJson(res, 200, result);
+        return true;
+    }
+
+    if (route === '/api/translate/segment' && req.method === 'POST') {
+        const data = await readJsonBody<{ text?: unknown; target?: unknown }>(req, 128 * 1024);
+        sendJson(res, 200, await retranslateSegment(data));
+        return true;
+    }
+
+    if (route === '/api/translate/tm-update' && req.method === 'POST') {
+        const data = await readJsonBody<{ source?: unknown; translated?: unknown; target?: unknown }>(
+            req,
+            128 * 1024
+        );
+        sendJson(res, 200, await saveMemoryEntry(data));
+        return true;
+    }
+
+    if (route === '/api/translate/queue') {
+        if (req.method === 'GET') {
+            sendJson(res, 200, { queue: getTranslationQueue() });
+            return true;
+        }
+        if (req.method === 'POST') {
+            const data = await readJsonBody<Record<string, unknown>>(req, 256 * 1024);
+            const rawItems = Array.isArray(data.items)
+                ? (data.items as Array<Record<string, unknown>>)
+                : [data];
+            const result = await enqueueTranslations(rawItems);
+            sendJson(res, 200, { success: true, ...result });
+            return true;
+        }
+        if (req.method === 'DELETE') {
+            const id = url.searchParams.get('id');
+            const queue = id ? removeQueuedTranslation(id) : clearTranslationQueue();
+            sendJson(res, 200, { success: true, queue });
+            return true;
+        }
+        sendJson(res, 405, { error: 'Method not allowed' });
+        return true;
+    }
+
+    if (route === '/api/translate/queue/remove' && req.method === 'POST') {
+        const data = await readJsonBody<{ id?: unknown }>(req, 16 * 1024);
+        sendJson(res, 200, { success: true, queue: removeQueuedTranslation(data.id) });
+        return true;
+    }
+
+    if (route === '/api/translate/queue/clear' && req.method === 'POST') {
+        sendJson(res, 200, { success: true, queue: clearTranslationQueue() });
         return true;
     }
 

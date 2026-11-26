@@ -3,14 +3,16 @@ import { api } from '../../lib/api';
 import { faNumber } from '../../lib/format';
 import type {
     BookSummary,
+    QueuedBookJob,
     TranslateConfigPublic,
     TranslateEngineInfo,
     TranslationEstimate,
     TranslationJob,
-    TranslationMode
+    TranslationMode,
+    TranslationPreviewResult
 } from '../../types';
 import { Icon } from '../icons';
-import { Button, Field, Toggle } from '../ui/Controls';
+import { Button, Field, TextInput, Toggle } from '../ui/Controls';
 import { Modal } from '../ui/Modal';
 
 const LANGUAGES = [
@@ -29,6 +31,8 @@ const LANGUAGES = [
     { value: 'zh', label: 'چینی' },
     { value: 'ja', label: 'ژاپنی' }
 ];
+
+const DEEPL_SUPPORTED = new Set(['en', 'ar', 'tr', 'ru', 'fr', 'de', 'es', 'id', 'zh', 'ja']);
 
 const STATUS_LABEL: Record<TranslationJob['status'], string> = {
     idle: 'آماده',
@@ -62,9 +66,16 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
     const [bilingual, setBilingual] = useState(false);
     const [force, setForce] = useState(false);
     const [markTranslator, setMarkTranslator] = useState(true);
+    const [pageRange, setPageRange] = useState('');
+    const [autoGlossary, setAutoGlossary] = useState(false);
     const [estimate, setEstimate] = useState<TranslationEstimate | null>(null);
+    const [estimateError, setEstimateError] = useState('');
     const [job, setJob] = useState<TranslationJob | null>(null);
+    const [queue, setQueue] = useState<QueuedBookJob[]>([]);
     const [busy, setBusy] = useState(false);
+    const [previewBusy, setPreviewBusy] = useState(false);
+    const [preview, setPreview] = useState<TranslationPreviewResult | null>(null);
+    const [glossaryBusy, setGlossaryBusy] = useState(false);
     const [error, setError] = useState('');
     const handledRef = useRef('');
 
@@ -81,6 +92,7 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
         [config, engines]
     );
     const keyMissing = Boolean(activeEngine?.needsKey && config && !config.hasApiKey);
+    const deeplUnsupported = config?.engine === 'deepl' && !DEEPL_SUPPORTED.has(target.toLowerCase());
 
     useEffect(() => {
         if (!open) return;
@@ -105,16 +117,20 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
         if (!open || !book) return;
         let cancelled = false;
         setError('');
+        setPreview(null);
         void (async () => {
             try {
                 const status = await api.translateStatus();
-                if (cancelled || !status.job) return;
+                if (cancelled) return;
+                if (Array.isArray(status.queue)) setQueue(status.queue);
+                if (!status.job) return;
                 const current = status.job;
                 const isActive = current.status === 'running' || current.status === 'paused';
                 if (current.filename === book.filename) {
                     setJob(current);
                     setTarget(current.target);
                     setBilingual(Boolean(current.bilingual));
+                    if (current.pageRange) setPageRange(current.pageRange);
                 } else if (isActive) {
                     setJob(current);
                 }
@@ -128,40 +144,92 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
     }, [open, book?.filename]);
 
     useEffect(() => {
-        if (!open || !book || running) return;
+        if (!open || !book || running || deeplUnsupported) {
+            if (deeplUnsupported) setEstimate(null);
+            return;
+        }
         let cancelled = false;
+        setEstimateError('');
         const timer = setTimeout(async () => {
             try {
-                const payload = await api.translateEstimate(book.filename, target, force, 'review');
-                if (!cancelled) setEstimate(payload);
-            } catch {
-                if (!cancelled) setEstimate(null);
+                const payload = await api.translateEstimate(
+                    book.filename,
+                    target,
+                    force,
+                    'translate',
+                    pageRange.trim() || undefined
+                );
+                if (!cancelled) {
+                    setEstimate(payload);
+                    setEstimateError('');
+                }
+            } catch (estErr) {
+                if (!cancelled) {
+                    setEstimate(null);
+                    setEstimateError(
+                        estErr instanceof Error ? estErr.message : ''
+                    );
+                }
             }
-        }, 220);
+        }, 250);
         return () => {
             cancelled = true;
             clearTimeout(timer);
         };
-    }, [open, book?.filename, target, force, running]);
+    }, [open, book?.filename, target, force, pageRange, running, deeplUnsupported]);
 
+    /* Live Server-Sent Events subscription with polling fallback */
     useEffect(() => {
-        if (!open || !job) return;
-        if (job.status !== 'running' && job.status !== 'paused') return;
-        let stopped = false;
-        const timer = setInterval(async () => {
-            try {
-                const status = await api.translateStatus();
-                if (stopped) return;
-                if (status.job) setJob(status.job);
-            } catch {
-                /* keep the last known progress */
-            }
-        }, 750);
-        return () => {
-            stopped = true;
-            clearInterval(timer);
+        if (!open) return;
+        let closed = false;
+        let source: EventSource | null = null;
+        let fallbackTimer: ReturnType<typeof setInterval> | null = null;
+
+        const startFallbackPolling = () => {
+            if (fallbackTimer) return;
+            fallbackTimer = setInterval(async () => {
+                if (closed) return;
+                try {
+                    const status = await api.translateStatus();
+                    if (closed) return;
+                    if (status.job) setJob(status.job);
+                    if (Array.isArray(status.queue)) setQueue(status.queue);
+                } catch {
+                    /* keep last state */
+                }
+            }, 900);
         };
-    }, [open, job?.id, job?.status]);
+
+        try {
+            source = new EventSource('/api/translate/events');
+            source.onmessage = (event) => {
+                if (closed) return;
+                try {
+                    const parsed = JSON.parse(event.data) as {
+                        job?: TranslationJob | null;
+                        queue?: QueuedBookJob[];
+                    };
+                    if (parsed.job !== undefined) setJob(parsed.job);
+                    if (Array.isArray(parsed.queue)) setQueue(parsed.queue);
+                } catch {
+                    /* ignore malformed frame */
+                }
+            };
+            source.onerror = () => {
+                source?.close();
+                source = null;
+                startFallbackPolling();
+            };
+        } catch {
+            startFallbackPolling();
+        }
+
+        return () => {
+            closed = true;
+            source?.close();
+            if (fallbackTimer) clearInterval(fallbackTimer);
+        };
+    }, [open]);
 
     useEffect(() => {
         if (!open || !job || !book) return;
@@ -183,6 +251,10 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
             setError('کلید این مترجم تنظیم نشده است؛ از تنظیمات ← ترجمه و مترجم آن را وارد کنید.');
             return;
         }
+        if (deeplUnsupported) {
+            setError('موتور DeepL از این زبان مقصد پشتیبانی نمی‌کند.');
+            return;
+        }
         setBusy(true);
         setError('');
         try {
@@ -190,7 +262,9 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                 force,
                 markTranslator,
                 mode,
-                bilingual
+                bilingual,
+                pageRange: pageRange.trim() || undefined,
+                autoGlossary
             });
             setJob(payload.job);
             handledRef.current = '';
@@ -206,6 +280,77 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
             notify(message, 'error');
         } finally {
             setBusy(false);
+        }
+    };
+
+    const enqueueCurrent = async () => {
+        setBusy(true);
+        try {
+            const result = await api.translateQueueAdd([
+                {
+                    filename: book.filename,
+                    target,
+                    mode: 'translate',
+                    bilingual,
+                    force,
+                    markTranslator,
+                    pageRange: pageRange.trim() || undefined,
+                    autoGlossary
+                }
+            ]);
+            setQueue(result.queue);
+            notify('کتاب به صف ترجمه اضافه شد.', 'success');
+        } catch (err) {
+            notify(err instanceof Error ? err.message : 'افزودن به صف انجام نشد.', 'error');
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const runPreview = async (page = 1) => {
+        if (keyMissing) {
+            setError('کلید این مترجم تنظیم نشده است.');
+            return;
+        }
+        if (deeplUnsupported) {
+            setError('موتور DeepL از این زبان مقصد پشتیبانی نمی‌کند.');
+            return;
+        }
+        setPreviewBusy(true);
+        setError('');
+        try {
+            const result = await api.translatePreview(book.filename, target, page);
+            setPreview(result);
+        } catch (prevErr) {
+            const msg = prevErr instanceof Error ? prevErr.message : 'پیش‌نمایش انجام نشد.';
+            setError(msg);
+            notify(msg, 'error');
+        } finally {
+            setPreviewBusy(false);
+        }
+    };
+
+    const runDiscoverGlossary = async () => {
+        setGlossaryBusy(true);
+        setError('');
+        try {
+            const res = await api.translateDiscoverGlossary(book.filename, target, true);
+            if (res.terms.length) {
+                notify(
+                    `${faNumber(res.terms.length)} اصطلاح استخراج و ${faNumber(res.mergedCount)} مورد تازه به واژه‌نامه اضافه شد.`,
+                    'success'
+                );
+                const cfg = await api.translateConfig();
+                setConfig(cfg.config);
+            } else {
+                notify('اصطلاح تازه‌ای در نمونهٔ متن پیدا نشد.', 'info');
+            }
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : 'استخراج واژه‌نامه انجام نشد.';
+            setError(msg);
+            notify(msg, 'error');
+        } finally {
+            setGlossaryBusy(false);
         }
     };
 
@@ -225,6 +370,8 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
             setBusy(false);
         }
     };
+
+    const alreadyQueued = queue.some((q) => q.filename === book.filename);
 
     return (
         <Modal
@@ -268,16 +415,32 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                     <div className="translate__notice" role="status">
                         <Icon name="info" size={15} />
                         <span>
-                            کتاب «{foreignJob.title}» در حال ترجمه است. تا پایان یا لغو آن، ترجمهٔ این کتاب آغاز
-                            نمی‌شود.
+                            کتاب «{foreignJob.title}» در حال ترجمه است. می‌توانید این کتاب را به صف ترجمه بیفزایید تا
+                            بلافاصله پس از پایان آن آغاز شود.
                         </span>
-                        <Button variant="danger" size="sm" icon="close" onClick={() => void runControl('cancel')}>
-                            لغو ترجمهٔ دیگر
-                        </Button>
+                        <div className="settings-actions">
+                            <Button
+                                variant="primary"
+                                size="sm"
+                                icon="plus"
+                                disabled={busy || alreadyQueued || keyMissing || deeplUnsupported}
+                                onClick={() => void enqueueCurrent()}
+                            >
+                                {alreadyQueued ? 'در صف است' : 'افزودن به صف ترجمه'}
+                            </Button>
+                            <Button variant="danger" size="sm" icon="close" onClick={() => void runControl('cancel')}>
+                                لغو ترجمهٔ دیگر
+                            </Button>
+                        </div>
                     </div>
                 ) : null}
 
-                {ownJob && (ownJob.status === 'running' || ownJob.status === 'paused' || ownJob.status === 'done' || ownJob.status === 'cancelled' || ownJob.status === 'error') ? (
+                {ownJob &&
+                (ownJob.status === 'running' ||
+                    ownJob.status === 'paused' ||
+                    ownJob.status === 'done' ||
+                    ownJob.status === 'cancelled' ||
+                    ownJob.status === 'error') ? (
                     <section className="translate__progress" aria-live="polite">
                         <div className="translate__head">
                             <span className="translate__percent">{faNumber(percent)}٪</span>
@@ -285,7 +448,13 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                                 {STATUS_LABEL[ownJob.status]}
                             </span>
                         </div>
-                        <div className="translate__bar" role="progressbar" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}>
+                        <div
+                            className="translate__bar"
+                            role="progressbar"
+                            aria-valuenow={percent}
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                        >
                             <span style={{ width: `${percent}%` }} />
                         </div>
 
@@ -294,9 +463,12 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                                 {ownJob.mode === 'review' ? 'بازبینی و ترمیم' : 'ترجمهٔ کامل'}
                             </span>
                             {ownJob.bilingual ? <span className="translate__badge">دوزبانه</span> : null}
+                            {ownJob.pageRange ? (
+                                <span className="translate__badge">صفحات: {ownJob.pageRange}</span>
+                            ) : null}
                             <span className="translate__badge">{ownJob.engineLabel}</span>
                             <span className="translate__badge">
-                                {ownJob.engine === 'gemini'
+                                {ownJob.engine === 'gemini' && config?.geminiPlan !== 'paid'
                                     ? 'ارسال ترتیبی امن (مکث خودکار)'
                                     : `${faNumber(ownJob.parallel)} درخواست هم‌زمان`}
                             </span>
@@ -322,6 +494,12 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                                 <span>{ownJob.mode === 'review' ? 'ترمیم‌شده' : 'ناموفق'}</span>
                                 <strong>{faNumber(ownJob.mode === 'review' ? ownJob.repaired : ownJob.failed)}</strong>
                             </div>
+                            {ownJob.mode === 'review' ? (
+                                <div className="translate__stat">
+                                    <span>ناموفق</span>
+                                    <strong>{faNumber(ownJob.failed)}</strong>
+                                </div>
+                            ) : null}
                             <div className="translate__stat">
                                 <span>زمان باقی‌مانده</span>
                                 <strong>{ownJob.status === 'running' ? faDuration(ownJob.etaSeconds) : '—'}</strong>
@@ -332,6 +510,18 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                                     {ownJob.speed > 0 ? `${faNumber(Math.round(ownJob.speed * 60))} رشته/دقیقه` : '—'}
                                 </strong>
                             </div>
+                            {ownJob.usage && ownJob.usage.requests > 0 ? (
+                                <>
+                                    <div className="translate__stat">
+                                        <span>توکن ورودی</span>
+                                        <strong>{faNumber(ownJob.usage.inputTokens)}</strong>
+                                    </div>
+                                    <div className="translate__stat">
+                                        <span>توکن خروجی</span>
+                                        <strong>{faNumber(ownJob.usage.outputTokens)}</strong>
+                                    </div>
+                                </>
+                            ) : null}
                         </div>
 
                         {ownJob.samples.length ? (
@@ -387,15 +577,24 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
 
                 {!ownJob || ownJob.status === 'idle' ? (
                     <section className="translate__settings">
-                        <Field label="زبان مقصد">
-                            <select className="input" value={target} onChange={(event) => setTarget(event.target.value)}>
-                                {LANGUAGES.map((language) => (
-                                    <option key={language.value} value={language.value}>
-                                        {language.label}
-                                    </option>
-                                ))}
-                            </select>
-                        </Field>
+                        <div className="translate__row">
+                            <Field label="زبان مقصد">
+                                <select className="input" value={target} onChange={(event) => setTarget(event.target.value)}>
+                                    {LANGUAGES.map((language) => (
+                                        <option key={language.value} value={language.value}>
+                                            {language.label}
+                                        </option>
+                                    ))}
+                                </select>
+                            </Field>
+                            <Field label="بازهٔ صفحات (اختیاری)" hint="مثال: ۱-۱۰، ۱۵ (خالی = کل کتاب)">
+                                <TextInput
+                                    value={pageRange}
+                                    placeholder="کل کتاب"
+                                    onChange={(event) => setPageRange(event.target.value)}
+                                />
+                            </Field>
+                        </div>
 
                         <div className="translate__engine-card">
                             <span className="translate__engine-icon">
@@ -406,7 +605,8 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                                 <small>
                                     {config?.engine === 'gemini' ? (
                                         <>
-                                            <bdi dir="ltr">{config.model || 'gemini-4-hydrogen'}</bdi> · کلید سرور و کنترل سرعت خودکار
+                                            <bdi dir="ltr">{config.model || 'gemini-4-hydrogen'}</bdi> ·{' '}
+                                            {config.geminiPlan === 'paid' ? 'پلن پولی (هم‌زمان)' : 'پلن رایگان (ترتیبی امن)'}
                                         </>
                                     ) : (
                                         <>
@@ -418,6 +618,16 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                             </div>
                             <span className="translate__engine-hint">تغییر از تنظیمات ← ترجمه و مترجم</span>
                         </div>
+
+                        {deeplUnsupported ? (
+                            <p className="translate__notice is-error" role="alert">
+                                <Icon name="alert" size={15} />
+                                <span>
+                                    موتور DeepL از زبان مقصد انتخاب‌شده پشتیبانی نمی‌کند؛ برای ترجمه به فارسی یا اردو از
+                                    جمنای، OpenAI، Claude یا گوگل ترنسلیت استفاده کنید.
+                                </span>
+                            </p>
+                        ) : null}
 
                         <Toggle
                             checked={bilingual}
@@ -437,20 +647,30 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                             label="ثبت «مترجم» در مشخصات کتاب"
                             hint="اگر فیلد مترجم خالی باشد، «ترجمهٔ ماشینی» نوشته می‌شود."
                         />
+                        {activeEngine?.kind === 'ai' ? (
+                            <Toggle
+                                checked={autoGlossary}
+                                onChange={setAutoGlossary}
+                                label="استخراج خودکار واژه‌نامه پیش از ترجمه"
+                                hint="نام‌های خاص و اصطلاحات کلیدی ابتدای کتاب یکبار استخراج می‌شوند تا همهٔ بخش‌ها یکدست ترجمه شوند."
+                            />
+                        ) : null}
 
                         {keyMissing ? (
                             <p className="translate__notice is-error" role="alert">
                                 <Icon name="alert" size={15} />
                                 <span>
-                                    کلید این مترجم تنظیم نشده است. از تنظیمات ← «ترجمه و مترجم» کلید را وارد کنید یا
-                                    یکی از مدل‌های آفلاین را انتخاب کنید.
+                                    کلید این مترجم تنظیم نشده است. از تنظیمات ← «ترجمه و مترجم» کلید را وارد کنید یا یکی از
+                                    مدل‌های آفلاین را انتخاب کنید.
                                 </span>
                             </p>
                         ) : null}
 
                         <div className="translate__estimate">
                             <Icon name="sparkles" size={15} />
-                            {estimate ? (
+                            {estimateError ? (
+                                <span>{estimateError}</span>
+                            ) : estimate ? (
                                 <span>
                                     {faNumber(estimate.segments)} رشته بررسی شد؛ <b>{faNumber(estimate.candidates)}</b> بخش
                                     باید ترجمه یا ترمیم شود
@@ -458,19 +678,88 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                                         ? ` (${faNumber(estimate.suspicious)} بخش نیمه‌ترجمه یا ناسالم)`
                                         : ''}
                                     {estimate.cached ? ` و ${faNumber(estimate.cached)} بخش از حافظه می‌آید` : ''}
-                                    {estimate.skipped ? `؛ ${faNumber(estimate.skipped)} بخش از قبل به زبان مقصد است` : ''}.
+                                    {estimate.skipped
+                                        ? `؛ ${faNumber(estimate.skipped)} بخش غیرمتنی، خارج از بازه یا از قبل ترجمه‌شده است`
+                                        : ''}
+                                    .
                                 </span>
                             ) : (
                                 <span>در حال بررسی متن کتاب…</span>
                             )}
                         </div>
 
+                        <div className="translate__tools-row">
+                            <Button
+                                variant="soft"
+                                size="sm"
+                                icon="eye"
+                                disabled={previewBusy || busy || keyMissing || deeplUnsupported}
+                                onClick={() => void runPreview(preview?.page ?? 1)}
+                            >
+                                {previewBusy ? 'در حال ترجمهٔ نمونه…' : 'پیش‌نمایش یک صفحه (آزمایشی)'}
+                            </Button>
+                            {activeEngine?.kind === 'ai' ? (
+                                <Button
+                                    variant="soft"
+                                    size="sm"
+                                    icon="sparkles"
+                                    disabled={glossaryBusy || busy || keyMissing}
+                                    onClick={() => void runDiscoverGlossary()}
+                                >
+                                    {glossaryBusy ? 'در حال استخراج…' : 'استخراج واژه‌نامه به تنظیمات'}
+                                </Button>
+                            ) : null}
+                        </div>
+
+                        {preview ? (
+                            <div className="translate__preview">
+                                <div className="translate__preview-head">
+                                    <strong>
+                                        پیش‌نمایش صفحهٔ {faNumber(preview.page)} از {faNumber(preview.totalPages)}
+                                    </strong>
+                                    <div className="settings-actions">
+                                        <Button
+                                            variant="soft"
+                                            size="sm"
+                                            disabled={previewBusy || preview.page <= 1}
+                                            onClick={() => void runPreview(preview.page - 1)}
+                                        >
+                                            صفحهٔ قبل
+                                        </Button>
+                                        <Button
+                                            variant="soft"
+                                            size="sm"
+                                            disabled={previewBusy || preview.page >= preview.totalPages}
+                                            onClick={() => void runPreview(preview.page + 1)}
+                                        >
+                                            صفحهٔ بعد
+                                        </Button>
+                                    </div>
+                                </div>
+                                {preview.items.length ? (
+                                    <div className="translate__samples">
+                                        {preview.items.map((item, idx) => (
+                                            <div className="translate__sample" key={idx}>
+                                                <small dir="auto">{item.source}</small>
+                                                <span dir="auto">{item.translated}</span>
+                                                <em className={item.qaOk ? 'is-ok' : 'is-warn'}>
+                                                    {item.qaOk ? 'کیفیت: سالم' : `هشدار کیفیت: ${item.qaIssue || 'بررسی شود'}`}
+                                                </em>
+                                            </div>
+                                        ))}
+                                    </div>
+                                ) : (
+                                    <p className="translate__message">در این صفحه متن قابل ترجمه‌ای پیدا نشد.</p>
+                                )}
+                            </div>
+                        ) : null}
+
                         <div className="translate__actions">
                             <Button
                                 variant="primary"
                                 size="md"
                                 icon="globe"
-                                disabled={busy || Boolean(foreignJob) || keyMissing}
+                                disabled={busy || Boolean(foreignJob) || keyMissing || deeplUnsupported || Boolean(estimateError)}
                                 onClick={() => void start('translate')}
                             >
                                 {busy ? 'در حال آماده‌سازی…' : 'شروع ترجمهٔ موازی'}
@@ -479,7 +768,7 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                                 variant="soft"
                                 size="md"
                                 icon="refresh"
-                                disabled={busy || Boolean(foreignJob) || keyMissing}
+                                disabled={busy || Boolean(foreignJob) || keyMissing || deeplUnsupported || Boolean(estimateError)}
                                 onClick={() => void start('review')}
                             >
                                 بازبینی و ترمیم ترجمهٔ موجود
@@ -496,17 +785,48 @@ export function TranslateDialog({ open, book, notify, onClose, onTranslated }: T
                         <p className="translate__engine-note">
                             <Icon name="shield" size={14} />
                             <span>
-                                متن مستقیم به مترجم انتخابی شما فرستاده می‌شود؛ برای مدل‌های محلی هیچ داده‌ای از این
-                                رایانه بیرون نمی‌رود. کلید API فقط در سرور برنامه ذخیره می‌شود و به مرورگر برنمی‌گردد.
+                                متن مستقیم به مترجم انتخابی شما فرستاده می‌شود؛ برای مدل‌های محلی هیچ داده‌ای از این رایانه
+                                بیرون نمی‌رود. کلید API فقط در سرور برنامه ذخیره می‌شود و به مرورگر برنمی‌گردد.
                             </span>
                         </p>
                     </section>
                 ) : null}
 
+                {queue.length ? (
+                    <div className="translate__queue">
+                        <div className="translate__queue-head">
+                            <strong>صف ترجمه ({faNumber(queue.length)} کتاب)</strong>
+                            <button
+                                type="button"
+                                className="settings-inline-link"
+                                onClick={() => void api.translateQueueClear().then((r) => setQueue(r.queue))}
+                            >
+                                پاک‌کردن صف
+                            </button>
+                        </div>
+                        {queue.map((item) => (
+                            <div key={item.id} className="translate__queue-item">
+                                <span>
+                                    {item.title} <small>({item.targetLabel})</small>
+                                </span>
+                                <button
+                                    type="button"
+                                    className="settings-inline-link"
+                                    onClick={() =>
+                                        void api.translateQueueRemove(item.id).then((r) => setQueue(r.queue))
+                                    }
+                                >
+                                    حذف
+                                </button>
+                            </div>
+                        ))}
+                    </div>
+                ) : null}
+
                 <p className="translate__foot-note">
-                    نشانه‌های Markdown، پیوندها، جدول‌ها و کد دست‌نخورده می‌مانند و پیش از شروع یک نسخهٔ پشتیبان کامل
-                    از همین کتاب ساخته می‌شود. دکمهٔ بازبینی، تمام فایل را سریع می‌گردد و تنها جمله‌های ترجمه‌نشده یا
-                    ناسالم را ترجمه می‌کند.
+                    نشانه‌های Markdown، پیوندها، جدول‌ها و کد دست‌نخورده می‌مانند و پیش از شروع یک نسخهٔ پشتیبان کامل از همین
+                    کتاب ساخته می‌شود. دکمهٔ بازبینی، تمام فایل را سریع می‌گردد و تنها جمله‌های ترجمه‌نشده یا ناسالم را ترجمه
+                    می‌کند.
                 </p>
             </div>
         </Modal>

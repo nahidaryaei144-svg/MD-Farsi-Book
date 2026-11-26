@@ -27,6 +27,7 @@ import { createZip } from './zip.js';
 const execFileAsync = promisify(execFile);
 
 export type ExportFormat = 'md' | 'html' | 'docx' | 'pdf';
+export type ExportDisplayMode = 'both' | 'translated' | 'original';
 
 export interface ExportResult {
     contentType: string;
@@ -194,12 +195,117 @@ function parseStandardNotes(body: string): { body: string; notes: StandardNote[]
     return { body: cleaned, notes };
 }
 
-function parseDocument(content: string, filename: string): DocumentModel {
+function findBalancedSpanClose(text: string, startIndex: number): number {
+    const tagRe = /<span\b[^>]*>|<\/span>/gi;
+    tagRe.lastIndex = startIndex;
+    let depth = 1;
+    let match: RegExpExecArray | null;
+    while ((match = tagRe.exec(text)) !== null) {
+        if (match[0].startsWith('</')) {
+            depth -= 1;
+            if (depth === 0) return match.index;
+        } else {
+            depth += 1;
+        }
+    }
+    return -1;
+}
+
+function filterBilingualContent(text: string, display: ExportDisplayMode): string {
+    if (display === 'both') return text;
+    if (
+        !/<span\b[^>]*\bclass\s*=\s*(?:"[^"]*\bbi-(?:orig|trans)\b|'[^']*\bbi-(?:orig|trans)\b)/i.test(
+            text
+        )
+    ) {
+        return text;
+    }
+
+    const openRe = /<span\b[^>]*\bclass\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>/gi;
+    let result = '';
+    let cursor = 0;
+
+    while (cursor < text.length) {
+        openRe.lastIndex = cursor;
+        const match = openRe.exec(text);
+        if (!match) {
+            result += text.slice(cursor);
+            break;
+        }
+
+        const classAttr = match[1] ?? match[2] ?? '';
+        const hasOrig = /(?:^|\s)bi-orig(?:\s|$)/.test(classAttr);
+        const hasTrans = /(?:^|\s)bi-trans(?:\s|$)/.test(classAttr);
+        if (!hasOrig && !hasTrans) {
+            result += text.slice(cursor, match.index + match[0].length);
+            cursor = match.index + match[0].length;
+            continue;
+        }
+
+        const openStart = match.index;
+        const openEnd = openStart + match[0].length;
+        const closeStart = findBalancedSpanClose(text, openEnd);
+        if (closeStart === -1) {
+            result += text.slice(cursor, openEnd);
+            cursor = openEnd;
+            continue;
+        }
+        const closeEnd = text.indexOf('>', closeStart) + 1;
+
+        result += text.slice(cursor, openStart);
+        const inner = text.slice(openEnd, closeStart);
+        const keep =
+            (display === 'translated' && hasTrans) ||
+            (display === 'original' && hasOrig);
+
+        if (keep) {
+            result += inner;
+            cursor = closeEnd;
+        } else {
+            const trimmedBr = result.replace(/[ \t]*<br\s*\/?>[ \t]*$/i, '');
+            if (trimmedBr !== result) {
+                result = trimmedBr;
+            }
+            let nextPos = closeEnd;
+            const rest = text.slice(nextPos);
+            const brAfter = rest.match(/^[ \t]*<br\s*\/?>[ \t]*/i);
+            if (brAfter) {
+                nextPos += brAfter[0].length;
+            } else {
+                const blankSep = rest.match(
+                    /^[ \t]*\n{1,2}[ \t]*(?=<span\b[^>]*\bbi-(?:orig|trans)\b)/i
+                );
+                if (blankSep) {
+                    nextPos += blankSep[0].length;
+                } else {
+                    const nlAfter = rest.match(/^[ \t]*\n/);
+                    if (nlAfter) {
+                        const dropped = result.replace(/\n[ \t]*\n[ \t]*$/, '\n');
+                        if (dropped !== result) {
+                            result = dropped;
+                            nextPos += nlAfter[0].length;
+                        }
+                    }
+                }
+            }
+            cursor = nextPos;
+        }
+    }
+
+    return result.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+}
+
+function parseDocument(
+    content: string,
+    filename: string,
+    display: ExportDisplayMode = 'both'
+): DocumentModel {
     const frontmatterMatch = content.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
     const frontmatterRaw = frontmatterMatch ? frontmatterMatch[0] : '';
-    const bodyRaw = (frontmatterMatch ? content.slice(frontmatterMatch[0].length) : content)
+    const rawBody = (frontmatterMatch ? content.slice(frontmatterMatch[0].length) : content)
         .replace(/^\uFEFF/, '')
         .replace(/\r\n/g, '\n');
+    const bodyRaw = filterBilingualContent(rawBody, display);
 
     const meta = parseFrontmatter(content);
     const headingMatch = bodyRaw.match(/^\s*#\s+(.+?)\s*$/m);
@@ -2580,6 +2686,8 @@ interface ParagraphOptions {
     align?: 'both' | 'center' | 'right' | 'left';
     indent?: number;
     border?: boolean;
+    rightBorder?: { color: string; sz?: number; space?: number };
+    shading?: string;
     pageBreakBefore?: boolean;
     spacingAfter?: number;
 }
@@ -2588,10 +2696,22 @@ function paragraph(content: string, options: ParagraphOptions = {}): string {
     const props: string[] = [];
     if (options.style) props.push(`<w:pStyle w:val="${options.style}"/>`);
     if (options.pageBreakBefore) props.push('<w:pageBreakBefore/>');
-    if (options.border) {
-        props.push(
-            '<w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="CBD5E1"/></w:pBdr>'
-        );
+    if (options.border || options.rightBorder) {
+        const bdrs: string[] = [];
+        if (options.border) {
+            bdrs.push('<w:bottom w:val="single" w:sz="6" w:space="1" w:color="CBD5E1"/>');
+        }
+        if (options.rightBorder) {
+            const sz = options.rightBorder.sz ?? 12;
+            const space = options.rightBorder.space ?? 6;
+            bdrs.push(
+                `<w:right w:val="single" w:sz="${sz}" w:space="${space}" w:color="${options.rightBorder.color}"/>`
+            );
+        }
+        props.push(`<w:pBdr>${bdrs.join('')}</w:pBdr>`);
+    }
+    if (options.shading) {
+        props.push(`<w:shd w:val="clear" w:color="auto" w:fill="${options.shading}"/>`);
     }
     props.push('<w:bidi/>');
     if (options.spacingAfter != null) props.push(`<w:spacing w:after="${options.spacingAfter}"/>`);
@@ -2636,25 +2756,143 @@ function inlineRuns(tokens: MdToken[] | undefined, format: RunFormat = {}): stri
         .join('');
 }
 
+interface BilingualDocxPart {
+    kind: 'orig' | 'trans' | 'plain';
+    text: string;
+}
+
+function extractBilingualParts(raw: string): BilingualDocxPart[] | null {
+    if (!/<span\b[^>]*\bclass\s*=\s*(?:"[^"]*\bbi-(?:orig|trans)\b|'[^']*\bbi-(?:orig|trans)\b)/i.test(raw)) {
+        return null;
+    }
+    const openRe = /<span\b[^>]*\bclass\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>/gi;
+    const parts: BilingualDocxPart[] = [];
+    let cursor = 0;
+
+    while (cursor < raw.length) {
+        openRe.lastIndex = cursor;
+        const match = openRe.exec(raw);
+        if (!match) {
+            const tail = raw.slice(cursor).replace(/^(?:\s*<br\s*\/?>\s*)+/gi, '').trim();
+            if (tail) parts.push({ kind: 'plain', text: tail });
+            break;
+        }
+        const classAttr = match[1] ?? match[2] ?? '';
+        const hasOrig = /(?:^|\s)bi-orig(?:\s|$)/.test(classAttr);
+        const hasTrans = /(?:^|\s)bi-trans(?:\s|$)/.test(classAttr);
+        if (!hasOrig && !hasTrans) {
+            cursor = match.index + match[0].length;
+            continue;
+        }
+        const before = raw
+            .slice(cursor, match.index)
+            .replace(/(?:\s*<br\s*\/?>\s*)+$/gi, '')
+            .trim();
+        if (before) parts.push({ kind: 'plain', text: before });
+
+        const openEnd = match.index + match[0].length;
+        const closeStart = findBalancedSpanClose(raw, openEnd);
+        if (closeStart < 0) {
+            const rest = raw.slice(match.index).trim();
+            if (rest) parts.push({ kind: 'plain', text: rest });
+            break;
+        }
+        const inner = raw.slice(openEnd, closeStart).trim();
+        if (inner) {
+            parts.push({ kind: hasOrig ? 'orig' : 'trans', text: inner });
+        }
+        cursor = raw.indexOf('>', closeStart) + 1;
+    }
+
+    return parts.some((part) => part.kind === 'orig' || part.kind === 'trans') ? parts : null;
+}
+
+function inlineRunsFromMarkdown(text: string, format: RunFormat = {}): string {
+    const lexed = marked.lexer(text) as unknown as MdToken[];
+    const first = lexed[0];
+    if (lexed.length === 1 && (first?.type === 'paragraph' || first?.type === 'text') && first.tokens) {
+        return inlineRuns(first.tokens, format);
+    }
+    return inlineRuns(lexed, format);
+}
+
+function renderBilingualDocxParagraphs(
+    raw: string,
+    options: { style?: string; indent?: number; headingDepth?: number; quote?: boolean; prefix?: string } = {}
+): string[] | null {
+    const parts = extractBilingualParts(raw);
+    if (!parts) return null;
+
+    const out: string[] = [];
+    let prefixPending = options.prefix ?? '';
+
+    for (const part of parts) {
+        const leadingRun = prefixPending ? run(prefixPending) : '';
+        prefixPending = '';
+        if (part.kind === 'orig') {
+            const origSize = options.headingDepth ? Math.max(22, 34 - options.headingDepth * 2) : 21;
+            out.push(
+                paragraph(
+                    leadingRun + inlineRunsFromMarkdown(part.text, { color: '475569', size: origSize }),
+                    {
+                        indent: (options.indent ?? 0) + 120,
+                        rightBorder: { color: '94A3B8', sz: 12, space: 6 },
+                        spacingAfter: 60
+                    }
+                )
+            );
+        } else if (part.kind === 'trans') {
+            if (options.headingDepth) {
+                out.push(
+                    paragraph(leadingRun + inlineRunsFromMarkdown(part.text), {
+                        style: `Heading${options.headingDepth}`
+                    })
+                );
+            } else {
+                out.push(
+                    paragraph(leadingRun + inlineRunsFromMarkdown(part.text), {
+                        style: options.quote ? 'Quote' : options.style,
+                        indent: options.indent,
+                        shading: options.quote ? undefined : 'EEF2FF',
+                        spacingAfter: 140
+                    })
+                );
+            }
+        } else {
+            out.push(
+                paragraph(leadingRun + inlineRunsFromMarkdown(part.text), {
+                    style: options.quote ? 'Quote' : options.style,
+                    indent: options.indent
+                })
+            );
+        }
+    }
+
+    return out;
+}
+
 function tableXml(token: MdToken): string {
     const header = token.header ?? [];
     const rows = token.rows ?? [];
+    const cellParagraphs = (content: { text: string; tokens?: MdToken[] }, headerCell: boolean) => {
+        const bi = renderBilingualDocxParagraphs(content.text);
+        if (bi) return bi.join('');
+        return paragraph(
+            inlineRuns(
+                content.tokens ?? [{ type: 'text', text: content.text }],
+                headerCell ? { bold: true, color: '312E81' } : {}
+            )
+        );
+    };
     const cell = (content: { text: string; tokens?: MdToken[] }) =>
-        `<w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/></w:tcPr>${paragraph(
-            inlineRuns(content.tokens ?? [{ type: 'text', text: content.text }])
-        )}</w:tc>`;
+        `<w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/></w:tcPr>${cellParagraphs(content, false)}</w:tc>`;
     const rowXml = (cells: { text: string; tokens?: MdToken[] }[], bold: boolean) =>
         `<w:tr>${bold ? '<w:trPr><w:tblHeader/></w:trPr>' : ''}${cells
             .map((content) =>
                 bold
                     ? `<w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/>` +
                       '<w:shd w:val="clear" w:color="auto" w:fill="EEF2FF"/></w:tcPr>' +
-                      paragraph(
-                          inlineRuns(content.tokens ?? [{ type: 'text', text: content.text }], {
-                              bold: true,
-                              color: '312E81'
-                          })
-                      ) +
+                      cellParagraphs(content, true) +
                       '</w:tc>'
                     : cell(content)
             )
@@ -2692,8 +2930,16 @@ function listBlocks(token: MdToken, indent: number, ordered: boolean): string[] 
                 continue;
             }
             if (child.type === 'paragraph' || child.type === 'text') {
-                const runs = inlineRuns(child.tokens ?? [{ type: 'text', text: child.text ?? '' }]);
-                out.push(paragraph((first ? run(prefix) : '') + runs, { indent: nestedIndent }));
+                const bi = renderBilingualDocxParagraphs(child.raw ?? child.text ?? '', {
+                    indent: nestedIndent,
+                    prefix: first ? prefix : ''
+                });
+                if (bi) {
+                    out.push(...bi);
+                } else {
+                    const runs = inlineRuns(child.tokens ?? [{ type: 'text', text: child.text ?? '' }]);
+                    out.push(paragraph((first ? run(prefix) : '') + runs, { indent: nestedIndent }));
+                }
             } else if (child.type === 'blockquote') {
                 out.push(
                     ...blocksFromTokens(child.tokens ?? [], {
@@ -2720,13 +2966,30 @@ function blocksFromTokens(
         switch (token.type) {
             case 'heading': {
                 const depth = Math.min(6, Math.max(1, token.depth ?? 1));
-                out.push(paragraph(inlineRuns(token.tokens), { style: `Heading${depth}` }));
+                const bi = renderBilingualDocxParagraphs(token.text ?? token.raw ?? '', {
+                    headingDepth: depth
+                });
+                if (bi) out.push(...bi);
+                else out.push(paragraph(inlineRuns(token.tokens), { style: `Heading${depth}` }));
                 break;
             }
             case 'paragraph':
             case 'text': {
-                const runs = inlineRuns(token.tokens ?? [{ type: 'text', text: token.text ?? '' }]);
-                out.push(paragraph(runs, { style: options.quote ? 'Quote' : undefined }));
+                const bi = renderBilingualDocxParagraphs(token.raw ?? token.text ?? '', {
+                    indent: options.indent,
+                    quote: options.quote
+                });
+                if (bi) {
+                    out.push(...bi);
+                } else {
+                    const runs = inlineRuns(token.tokens ?? [{ type: 'text', text: token.text ?? '' }]);
+                    out.push(
+                        paragraph(runs, {
+                            style: options.quote ? 'Quote' : undefined,
+                            indent: options.indent
+                        })
+                    );
+                }
                 break;
             }
             case 'blockquote':
@@ -2751,8 +3014,17 @@ function blocksFromTokens(
                 out.push(tableXml(token));
                 break;
             case 'html': {
-                const text = stripTags(token.text ?? token.raw ?? '').trim();
-                if (text) out.push(paragraph(run(text)));
+                const rawHtml = token.text ?? token.raw ?? '';
+                const bi = renderBilingualDocxParagraphs(rawHtml, {
+                    indent: options.indent,
+                    quote: options.quote
+                });
+                if (bi) {
+                    out.push(...bi);
+                } else {
+                    const text = stripTags(rawHtml).trim();
+                    if (text) out.push(paragraph(run(text)));
+                }
                 break;
             }
             case 'space':
@@ -2861,15 +3133,21 @@ function createDocx(doc: DocumentModel): Buffer {
                 paragraph(run('پاورقی‌ها', { bold: true }), { style: 'Heading4', spacingAfter: 60 })
             );
             footnotes.forEach((note) => {
-                body.push(
-                    paragraph(
-                        run(`${note.label}) `, { bold: true, size: 18 }) +
-                            inlineRuns(
-                                marked.lexer(note.text) as unknown as MdToken[]
-                            ),
-                        { style: 'Quote' }
-                    )
-                );
+                const noteBi = renderBilingualDocxParagraphs(note.text, {
+                    quote: true,
+                    prefix: `${note.label}) `
+                });
+                if (noteBi) {
+                    body.push(...noteBi);
+                } else {
+                    body.push(
+                        paragraph(
+                            run(`${note.label}) `, { bold: true, size: 18 }) +
+                                inlineRunsFromMarkdown(note.text),
+                            { style: 'Quote' }
+                        )
+                    );
+                }
             });
         }
     };
@@ -3035,13 +3313,14 @@ async function printToPdf(html: string): Promise<Buffer | null> {
 
 export async function buildExport(
     filename: unknown,
-    format: ExportFormat
+    format: ExportFormat,
+    display: ExportDisplayMode = 'both'
 ): Promise<ExportResult> {
     const filePath = resolveBookPath(filename);
     if (!filePath) throw new HttpError('فایل کتاب برای خروجی معتبر نیست.');
 
     const content = await fs.promises.readFile(filePath, 'utf8');
-    const doc = parseDocument(content, String(filename));
+    const doc = parseDocument(content, String(filename), display);
     const base = asciiNamePart(doc.title);
     const name = fileNamePart(doc.title);
 

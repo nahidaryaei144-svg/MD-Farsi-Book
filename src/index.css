@@ -8082,3 +8082,130 @@ kbd {
     border-color: transparent;
     color: #fff;
 }
+
+/* ============================== Translation preview, queue & segment editor ============================== */
+
+.translate__tools-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.translate__preview {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.03);
+    max-height: 280px;
+    overflow-y: auto;
+}
+
+.translate__preview-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 0.7rem;
+}
+
+.translate__sample em {
+    font-style: normal;
+    font-size: 0.58rem;
+    align-self: flex-start;
+    padding: 1px 7px;
+    border-radius: 6px;
+}
+
+.translate__sample em.is-ok {
+    background: rgba(16, 185, 129, 0.14);
+    color: #34d399;
+}
+
+.translate__sample em.is-warn {
+    background: rgba(245, 158, 11, 0.16);
+    color: #fbbf24;
+}
+
+.translate__queue {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 9px 11px;
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    background: rgba(255, 255, 255, 0.03);
+    font-size: 0.66rem;
+}
+
+.translate__queue-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.translate__queue-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding-top: 4px;
+    border-top: 1px dashed var(--border);
+}
+
+.translate__queue-item small {
+    color: var(--muted);
+}
+
+.reader.is-bi-editing .book-page__body .bi-trans,
+.reader.is-bi-editing .book-footnote-text .bi-trans {
+    cursor: pointer;
+    outline: 1px dashed rgba(99, 102, 241, 0.5);
+    outline-offset: 2px;
+    transition: background 0.15s ease, outline-color 0.15s ease;
+}
+
+.reader.is-bi-editing .book-page__body .bi-trans:hover,
+.reader.is-bi-editing .book-footnote-text .bi-trans:hover {
+    background: rgba(99, 102, 241, 0.12);
+    outline-color: rgba(99, 102, 241, 0.9);
+}
+
+.bi-segment-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.bi-segment-editor__orig {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.bi-segment-editor__orig span,
+.bi-segment-editor__label > span {
+    font-size: 0.66rem;
+    font-weight: 700;
+    color: var(--muted);
+}
+
+.bi-segment-editor__orig p {
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.9;
+}
+
+.bi-segment-editor__label {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+

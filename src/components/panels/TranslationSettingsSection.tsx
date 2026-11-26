@@ -1,7 +1,13 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../lib/api';
 import { faNumber } from '../../lib/format';
-import type { TranslateEngineId, TranslateEngineInfo } from '../../types';
+import type {
+    GeminiPlan,
+    TranslateEngineId,
+    TranslateEngineInfo,
+    TranslationPreset,
+    TranslationPresetId
+} from '../../types';
 import { Icon } from '../icons';
 import { Button, Field, TextInput, Toggle } from '../ui/Controls';
 
@@ -49,9 +55,12 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
     const [apiKey, setApiKey] = useState('');
     const [savedKey, setSavedKey] = useState(false);
     const [savedEngine, setSavedEngine] = useState<TranslateEngineId>('google');
+    const [geminiPlan, setGeminiPlan] = useState<GeminiPlan>('free');
     const [concurrency, setConcurrency] = useState(8);
     const [order, setOrder] = useState<'page' | 'structured'>('page');
     const [bilingual, setBilingual] = useState(false);
+    const [presets, setPresets] = useState<TranslationPreset[]>([]);
+    const [presetId, setPresetId] = useState<TranslationPresetId>('islamic-ar-fa');
     const [texts, setTexts] = useState({
         prompt: '',
         rules: '',
@@ -64,6 +73,7 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
     const [error, setError] = useState('');
 
     const engine = engines.find((item) => item.id === engineId);
+    const activePreset = presets.find((item) => item.id === presetId);
     const hasKey = savedKey && engineId === savedEngine;
 
     useEffect(() => {
@@ -73,14 +83,17 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
                 const payload = await api.translateConfig();
                 if (cancelled) return;
                 setEngines(payload.engines);
+                setPresets(payload.presets ?? []);
                 setEngineId(payload.config.engine);
                 setSavedEngine(payload.config.engine);
                 setEndpoint(payload.config.endpoint);
                 setModel(payload.config.model);
                 setSavedKey(payload.config.hasApiKey);
+                setGeminiPlan(payload.config.geminiPlan ?? 'free');
                 setConcurrency(payload.config.concurrency);
                 setOrder(payload.config.order);
                 setBilingual(Boolean(payload.config.bilingual));
+                setPresetId(payload.config.preset ?? 'islamic-ar-fa');
                 setTexts({
                     prompt: payload.config.prompt,
                     rules: payload.config.rules,
@@ -95,6 +108,18 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
             cancelled = true;
         };
     }, []);
+
+    const applyPreset = (id: TranslationPresetId) => {
+        setPresetId(id);
+        const found = presets.find((item) => item.id === id);
+        if (!found || id === 'custom') return;
+        setTexts({
+            prompt: found.prompt,
+            rules: found.rules,
+            fmRules: found.fmRules,
+            glossary: found.glossary
+        });
+    };
 
     const pickEngine = (id: TranslateEngineId) => {
         setEngineId(id);
@@ -122,6 +147,8 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
             engine: engineId,
             endpoint: endpoint.trim(),
             model: model.trim(),
+            geminiPlan,
+            preset: presetId,
             prompt: texts.prompt,
             rules: texts.rules,
             fmRules: texts.fmRules,
@@ -212,20 +239,40 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
 
                     {engine?.needsModel ? (
                         engineId === 'gemini' ? (
-                            <Field
-                                label="مدل جمنای"
-                                hint="مدل‌های رایگان جمنای با کلید متصل در سرور. در این حالت درخواست‌ها با مکث خودکار ارسال می‌شوند تا خطا ندهد."
-                            >
-                                <select
-                                    className="input select"
-                                    dir="ltr"
-                                    value={model || 'gemini-4-hydrogen'}
-                                    onChange={(event) => setModel(event.target.value)}
+                            <>
+                                <Field
+                                    label="مدل جمنای"
+                                    hint="مدل‌های جمنای متصل به کلید سرور."
                                 >
-                                    <option value="gemini-4-hydrogen">gemini-4-hydrogen (پیشنهادی — متعادل و دقیق)</option>
-                                    <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (سبک و سریع‌تر)</option>
-                                </select>
-                            </Field>
+                                    <select
+                                        className="input select"
+                                        dir="ltr"
+                                        value={model || 'gemini-4-hydrogen'}
+                                        onChange={(event) => setModel(event.target.value)}
+                                    >
+                                        <option value="gemini-4-hydrogen">gemini-4-hydrogen (پیشنهادی — متعادل و دقیق)</option>
+                                        <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (سبک و سریع‌تر)</option>
+                                    </select>
+                                </Field>
+                                <Field
+                                    label="نوع پلن جمنای"
+                                    hint={
+                                        geminiPlan === 'paid'
+                                            ? 'در پلن پولی (Pay-as-you-go)، مکث اجباری ۴.۵ ثانیه‌ای برداشته می‌شود و درخواست‌ها با هم‌زمانی تنظیم‌شده ارسال می‌شوند.'
+                                            : 'در پلن رایگان، درخواست‌ها به‌صورت ترتیبی با مکث خودکار ارسال می‌شوند تا سهمیهٔ دقیقه پر نشود.'
+                                    }
+                                >
+                                    <select
+                                        className="input select"
+                                        value={geminiPlan}
+                                        onChange={(event) => setGeminiPlan(event.target.value as GeminiPlan)}
+                                        aria-label="نوع پلن جمنای"
+                                    >
+                                        <option value="free">رایگان (ارسال ترتیبی با مکث خودکار)</option>
+                                        <option value="paid">پولی (هم‌زمان و بدون مکث اجباری)</option>
+                                    </select>
+                                </Field>
+                            </>
                         ) : (
                             <Field
                                 label="نام مدل"
@@ -313,16 +360,16 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
                         <Field
                             label="موازی‌سازی (درخواست هم‌زمان)"
                             hint={
-                                engineId === 'gemini'
-                                    ? 'برای API رایگان جمنای به‌صورت خودکار ۱ (ارسال ترتیبی با مکث ۴.۵ ثانیه‌ای) اعمال می‌شود تا خطای محدودیت نرخ ندهد؛ عدد شما برای سایر مدل‌ها حفظ می‌شود.'
-                                    : 'هر چه بیشتر، سریع‌تر؛ سقف ثابتی در کار نیست و به سهمیهٔ سرویس شما بستگی دارد.'
+                                engineId === 'gemini' && geminiPlan !== 'paid'
+                                    ? 'برای پلن رایگان جمنای به‌صورت خودکار ۱ (ارسال ترتیبی با مکث ۴.۵ ثانیه‌ای) اعمال می‌شود؛ با انتخاب پلن پولی عدد زیر فعال می‌شود.'
+                                    : 'در صورت دریافت خطای محدودیت نرخ (429)، کنترل‌گر تطبیقی به‌طور خودکار هم‌زمانی را کاهش و پس از پایداری دوباره افزایش می‌دهد.'
                             }
                         >
-                            {engineId === 'gemini' ? (
+                            {engineId === 'gemini' && geminiPlan !== 'paid' ? (
                                 <input
                                     type="text"
                                     className="input"
-                                    value="۱ (ارسال ترتیبی امن برای جمنای)"
+                                    value="۱ (ارسال ترتیبی امن برای جمنای رایگان)"
                                     readOnly
                                     disabled
                                     aria-label="تعداد درخواست‌های هم‌زمان برای جمنای"
@@ -353,6 +400,29 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
                         </Field>
                     </div>
 
+                    {presets.length ? (
+                        <Field
+                            label="پروفایل آمادهٔ پرامپت"
+                            hint={
+                                activePreset?.description ||
+                                'با انتخاب پروفایل، دستورها و قواعد متناسب با نوع کتاب پر می‌شوند؛ سپس می‌توانید هر بخش را دلخواه ویرایش کنید.'
+                            }
+                        >
+                            <select
+                                className="input select"
+                                value={presetId}
+                                onChange={(event) => applyPreset(event.target.value as TranslationPresetId)}
+                                aria-label="پروفایل آمادهٔ پرامپت"
+                            >
+                                {presets.map((preset) => (
+                                    <option key={preset.id} value={preset.id}>
+                                        {preset.label}
+                                    </option>
+                                ))}
+                            </select>
+                        </Field>
+                    ) : null}
+
                     {INSTRUCTION_FIELDS.map((field) => (
                         <Field key={field.key} label={field.label} hint={field.hint}>
                             <textarea
@@ -361,16 +431,18 @@ export function TranslationSettingsSection({ notify }: TranslationSettingsSectio
                                 rows={field.rows}
                                 value={texts[field.key]}
                                 placeholder="خالی بگذارید تا هیچ دستوری فرستاده نشود…"
-                                onChange={(event) =>
-                                    setTexts((current) => ({ ...current, [field.key]: event.target.value }))
-                                }
+                                onChange={(event) => {
+                                    setPresetId('custom');
+                                    setTexts((current) => ({ ...current, [field.key]: event.target.value }));
+                                }}
                             />
                         </Field>
                     ))}
 
                     <p className="settings-block__label">
-                        هیچ محدودیتی روی زبان، اصطلاح‌ها، ارقام یا نویسه‌ها اعمال نمی‌شود؛ خروجی مترجم همان است که
-                        خودش می‌نویسد و متن کتاب هم دست‌نخورده می‌ماند.
+                        در ترجمه به فارسی، یکسان‌سازی خودکار حروف («ي/ك» ← «ی/ک»)، اصلاح نیم‌فاصله‌های استاندارد
+                        («می‌»، «‌ها») و نشانه‌گذاری فارسی پس از ترجمه روی متن پیاده‌سازی می‌شود؛ کدها، نشانی‌ها و آیات داخل
+                        آکولاد {'{…}'} دست‌نخورده می‌مانند.
                     </p>
 
                     <div className="settings-actions">

@@ -36,6 +36,7 @@
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/75edabb8-880f-4e56-92e5-6c218ca30b3c" />
 
+صفحه جستجو
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/f13e0541-ae76-4d0c-ab40-f5c0600904d9" />
 
 
